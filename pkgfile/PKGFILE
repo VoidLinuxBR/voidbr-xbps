@@ -3,7 +3,7 @@
 pkgname=voidbr-xbps
 pkgdesc="XBPS package system utilities support hooks"
 pkgver=0.60.7
-pkgrel=4
+pkgrel=5
 provides=()
 replaces=(xbps)
 arch=('any')
