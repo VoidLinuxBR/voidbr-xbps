@@ -3,7 +3,7 @@
 pkgname=voidbr-xbps
 pkgdesc="XBPS package system utilities support hooks"
 pkgver=0.60.7
-pkgrel=6
+pkgrel=7
 provides=()
 replaces=(xbps)
 arch=('any')
@@ -20,7 +20,6 @@ depends=(
 	glibc
 	libcrypto3
 	libssl3
-	libxbps
 )
 backup=()
 
