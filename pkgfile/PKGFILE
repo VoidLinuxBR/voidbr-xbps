@@ -1,11 +1,11 @@
 # Maintainer: Vilmar Catafesta <vcatafesta@gmail.com>
 
 pkgname=voidbr-pkgname
-pkgdesc="Package template for VoidLinuxBR"
-pkgver=$(date +%Y%m%d)
-pkgrel=$(date +%H%M)
+pkgdesc="XBPS package system utilities support hooks"
+pkgver=0.60.7
+pkgrel=2
 provides=()
-replaces=()
+replaces=(xbps)
 arch=('any')
 license=('MIT')
 #url="ssh://git@github.com/voidlinuxbr/${pkgname}"
@@ -15,13 +15,6 @@ md5sums=('SKIP')
 makedepends=()
 depends=()
 backup=()
-
-# Automatically detect and use the correct install file
-if [ -e "${pkgname}.install" ]; then
-	install=${pkgname}.install
-elif [ -e "pkgbuild.install" ]; then
-	install=pkgfile.install
-fi
 
 package() {
 	# Verify default folder

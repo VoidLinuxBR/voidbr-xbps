@@ -1,0 +1,58 @@
+.Dd Feb 9, 2023
+.Dt XBPS-DIGEST 1
+.Os
+.Sh NAME
+.Nm xbps-digest
+.Nd XBPS utility to generate message digests
+.Sh SYNOPSIS
+.Nm
+.Op OPTIONS
+.Op FILE
+.Op FILE+N
+.Sh DESCRIPTION
+The
+.Nm
+utility generates message digests for specified
+.Ar FILE
+or
+.Ar stdin
+if unset.
+.Sh OPTIONS
+.Bl -tag -width -x
+.It Fl m, Fl -mode Ar mode
+Sets the message digest mode. Supported:
+.Ar sha256 .
+If unset, defaults to
+.Ar sha256 .
+.It Fl h, Fl -help
+Show the help message.
+.It Fl V, Fl -version
+Show the version information.
+.El
+.Sh EXIT STATUS
+.Ex
+A descriptive error message will be printed to stderr.
+.Sh SEE ALSO
+.Xr xbps-alternatives 1 ,
+.Xr xbps-checkvers 1 ,
+.Xr xbps-create 1 ,
+.Xr xbps-dgraph 1 ,
+.Xr xbps-fbulk 1 ,
+.Xr xbps-fetch 1 ,
+.Xr xbps-install 1 ,
+.Xr xbps-pkgdb 1 ,
+.Xr xbps-query 1 ,
+.Xr xbps-reconfigure 1 ,
+.Xr xbps-remove 1 ,
+.Xr xbps-rindex 1 ,
+.Xr xbps-uchroot 1 ,
+.Xr xbps-uunshare 1 ,
+.Xr xbps.d 5
+.Sh AUTHORS
+.An Juan Romero Pardines Aq Mt xtraeme@gmail.com
+.Sh BUGS
+Probably, but I try to make this not happen. Use it under your own
+responsibility and enjoy your life.
+.Pp
+Report bugs at
+.Lk https://github.com/void-linux/xbps/issues

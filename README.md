@@ -1,3 +1,3 @@
-# voidbr-pkgfile
+# voidbr-xbps
 
-Template for VoidBR pkgmake/pkgfile packages
+The X Binary Package System (XBPS) supporting hooks

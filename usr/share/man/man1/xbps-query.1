@@ -1,0 +1,410 @@
+.Dd Feb 9, 2023
+.Dt XBPS-QUERY 1
+.Os
+.Sh NAME
+.Nm xbps-query
+.Nd XBPS utility to query for package and repository information
+.Sh SYNOPSIS
+.Nm
+.Op OPTIONS
+.Ar MODE
+.Op ARGUMENTS
+.Sh DESCRIPTION
+The
+.Nm
+utility prints information of a specific package or packages stored
+in target root directory or in registered repositories.
+The argument
+.Ar PKG
+is a package expression, which is explained in the
+.Em PACKAGE EXPRESSION
+section.
+.Sh PACKAGE EXPRESSION
+A package expression is a form to match a pattern; currently xbps
+supports 3 ways to specify them:
+.Bl -dash
+.It
+by package name, i.e:
+.Dq Sy foo .
+.It
+by exact package name and version, i.e:
+.Dq Sy foo-1.0_1 .
+.It
+by specifying a package name and version separated by any of the following version comparators:
+.Pp
+.Bl -item -compact
+.It
+.Sy <
+less than
+.It
+.Sy >
+greater than
+.It
+.Sy <=
+less or equal than
+.It
+.Sy >=
+greater or equal than
+.Pp
+Example:
+.Dq Sy foo>=2.0 .
+.El
+.El
+.Pp
+The first repository matching the package expression wins.
+.Sh PACKAGE MODES
+An installed package can have some specific modes of operation.
+Currently the following modes are available:
+.Bl -tag -width -x
+.It Sy hold
+The package is on hold mode.
+Packages in this mode won't be updated unless it's explicitely declared to be updated.
+The only way to update packages in this mode is by using the
+.Fl f, Fl -force
+option.
+To list packages in this mode use
+.Nm xbps-query Fl H .
+.It Sy manual
+The package is in manual mode of installation and won't be considered for
+removal when running
+.Nm xbps-remove Fl o .
+To list packages in this mode use
+.Nm xbps-query Fl m .
+.It Sy repolock
+A package in repolock mode will only accept updates that are available in the
+same repository that was used for installing.
+To list packages in this mode use
+.Nm xbps-query Fl -list-repolock-pkgs .
+.El
+.Sh OPTIONS
+.Bl -tag -width -x
+.It Fl C, Fl -config Ar dir
+Specifies a path to the XBPS configuration directory.
+If the first character is not '/' then it's a relative path of
+.Ar rootdir .
+.It Fl c, Fl -cachedir Ar dir
+Specifies a path to the cache directory, where binary packages are stored.
+If the first character is not '/' then it's a relative path of
+.Ar rootdir .
+.It Fl d, Fl -debug
+Enables extra debugging shown to stderr.
+.It Fl h, Fl -help
+Show the help message.
+.It Fl i, Fl -ignore-conf-repos
+Ignore repositories defined in configuration files.
+Only repositories specified in the command line via
+.Ar --repository
+will be used.
+.It Fl M, Fl -memory-sync
+For remote repositories, the data is fetched and stored in memory for the current
+operation.
+This ignores the existing on-disk repository archives in rootdir.
+.It Fl p, Fl -property Ar PROP[,...]
+Only match this package property.
+Multiple properties can be specified by delimiting them with commas.
+For a list of available properties, see the
+.Sx PROPERTIES
+section.
+.It Fl R
+Enable repository mode.
+This mode explicitly looks in repositories, rather
+than looking in the target root directory.
+.It Fl -repository Ar url
+Enables repository mode and adds the specified repository to the top of the list.
+The
+.Ar url
+argument expects a URL to the repository for remote repositories or
+a path for local repositories.
+Note that remote repositories must be signed using
+.Xr xbps-rindex 1 .
+This option can be specified multiple times.
+.It Fl -regex
+Enables string matching by using Extended Regular Expressions in compatible modes,
+currently in the
+.Sy ownedby
+and
+.Sy search
+modes.
+.It Fl -fulldeptree
+Prints a full dependency tree in the
+.Sy show dependencies
+mode.
+.It Fl -staging
+Enables the use of staged packages from remote repositories.
+.It Fl r, Fl -rootdir Ar dir
+Specifies a full path for the target root directory.
+.It Fl v, Fl -verbose
+Enables verbose messages.
+.It Fl V, Fl -version
+Show the version information.
+.El
+.Sh MODE
+Only one of the following modes can be used at a time.
+By default and unless the
+.Fl R
+option is specified, the target
+.Ar PKG
+will be queried in the root directory, otherwise it will be
+queried in registered repositories.
+.Bl -tag -width -x
+.It Fl l, Fl -list-pkgs
+Lists registered packages in the package database (pkgdb).
+A package can be in any of the following states:
+.Pp
+.Bl -item -compact
+.It
+.Sy ii
+Package is installed.
+.It
+.Sy uu
+Package is unpacked but must be configured with
+.Xr xbps-reconfigure 1 .
+.It
+.Sy hr
+Package is
+.Sy half-removed ,
+and can be fully removed with
+.Xr xbps-remove 1 .
+.It
+.Sy ??
+Package state is unknown.
+.El
+.It Fl L, Fl -list-repos
+Lists repositories and the number of packages contained on them.
+If a repository is not available the number of packages will be
+.Sy -1 .
+The
+.Fl v
+option can be used to show more detailed information of remote repositories.
+.It Fl H, Fl -list-hold-pkgs
+List registered packages in the package database (pkgdb) that are on
+.Sy hold .
+Such packages won't be updated automatically.
+.It Fl m, Fl -list-manual-pkgs
+Lists registered packages in the package database (pkgdb) that were installed
+manually by the user (i.e not as dependency of any package).
+.It Fl O, Fl -list-orphans
+Lists package orphans in the package database (pkgdb), i.e packages that
+were installed as dependencies and no package is currently depending on them
+directly.
+.It Fl -list-repolock-pkgs
+Lists packages that are in repolock mode.
+See the
+.Em PACKAGE MODES
+section for more information.
+.It Fl o, Fl -ownedby Ar PATTERN [ Fl R ] [ Fl -regex ]
+Search for installed package files by matching
+.Ar PATTERN .
+The
+.Ar PATTERN
+argument can be a simple string, a shell wildcard pattern as explained in
+.Xr fnmatch 3
+or an Extended Regular Expression as explained in
+.Xr regex 7
+(if
+.Fl -regex
+option is set).
+If the
+.Fl R
+option is set, the matched
+.Ar PATTERN
+in repositories will be shown.
+.It Fl S, Fl -show Ar PKG [ Fl R ] [ Fl -property Ar PROP ]
+Shows information of an installed package.
+This is the default mode if no other mode is set.
+If the
+.Fl R
+option is set, the matched
+.Ar PKG
+in repositories will be shown.
+If a package property is specified with
+.Fl -property,
+only that property will be shown.
+.It Fl s, Fl -search Ar PATTERN [ Fl R ] [ Fl -property Ar PROP ] [ Fl -regex ]
+Search for packages by matching
+.Ar PATTERN
+on its
+.Em pkgver
+and/or
+.Em short_desc
+properties.
+The same rules explained in the
+.Fl -ownedby
+option are applied, but a
+.Sy PACKAGE EXPRESSION
+is also supported.
+If a package property is specified with
+.Fl -property,
+all packages matching
+.Ar PATTERN
+against
+.Ar PROP
+will be shown.
+.It Fl f, Fl -files Ar PKG [ Fl R ]
+Show the package files for
+.Ar PKG .
+If the
+.Fl R
+option is set, the matched
+.Ar PKG
+in repositories will be shown.
+.It Fl x, Fl -deps Ar PKG [ Fl R ]
+Show the required dependencies for
+.Ar PKG .
+Only direct dependencies are shown.
+To see a full dependency tree, also set
+.Fl -fulldeptree .
+If the
+.Fl R
+option is set, the matched
+.Ar PKG
+in repositories will be shown.
+.It Fl X, Fl -revdeps Ar PKG [ Fl R ]
+Show the reverse dependencies for
+.Ar PKG .
+If the
+.Fl R
+option is set, the matched
+.Ar PKG
+in repositories will be shown.
+.It Fl -cat Ar FILE Ar PKG
+Prints the file
+.Ar FILE
+stored in binary package
+.Ar PKG
+to stdout.
+The first repository matching the
+.Ar PKG
+expression wins.
+This expects an absolute path.
+This mode only works with repositories.
+.El
+.Sh PROPERTIES
+This is the list of a packages properties.
+Note that not all properties are available for all packages.
+.Pp
+.Bl -tag -compact -width 17m
+.It Ic alternatives
+group and file alternatives provided by the package.
+.It Ic architecture
+target architecture the package was build for.
+.It Ic automatic-install
+returns "yes" if the package was installed automatically.
+.It Ic build-options
+enabled options the package was built with.
+.It Ic changelog
+changelog URL for the package.
+.It Ic conf_files
+configuration file(s) installed by the package.
+.It Ic conflicts
+other packages this package conflicts with.
+.It Ic filename-sha256
+hash of the package file.
+.It Ic filename-size
+size of the package file.
+.It Ic hold
+returns "yes" if the package is held and will not be updated.
+.It Ic homepage
+home URL of the package project.
+.It Ic install-date
+date when the package was installed.
+.It Ic install-msg
+post-install message provided by the package.
+.It Ic install-script
+script used for installing the package.
+.It Ic installed_size
+total size of files installed by the package.
+.It Ic license
+license(s) for distributing the package.
+.It Ic maintainer
+contact of the maintainer of the package.
+.It Ic metafile-sha256
+hash of the plist package files metadata.
+.It Ic pkgname
+name of the package.
+.It Ic pkgver
+version of the package.
+.It Ic preserve
+returns "yes" if the package will not be removed automatically on update.
+.It Ic provides
+abstract facility provided by the package.
+.It Ic remove-msg
+post-remove message provided by the package.
+.It Ic remove-script
+script used for removing the package.
+.It Ic replaces
+other packages that the package replaces.
+.It Ic repolock
+returns "yes" if the package only accepts updates from original repository.
+.It Ic repository
+repository where the package was installed from.
+.It Ic reverts
+previous provided version this package replaces.
+.It Ic run_depends
+other runtime dependency packages for the package.
+.It Ic shlib-provides
+shared libraries provided by the package.
+.It Ic shlib-requires
+shared libraries required by the package.
+.It Ic short_desc
+short description of the package.
+.It Ic source-revisions
+commit hash of package last change from the void-packages repository.
+.It Ic state
+installation state of the package.
+.It Ic tags
+list of categories the package is associated with.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width XBPS_TARGET_ARCH
+.It Sy XBPS_ARCH
+Overrides
+.Xr uname 2
+machine result with this value.
+Useful to install packages with a fake
+architecture.
+.It Sy XBPS_TARGET_ARCH
+Sets the target architecture to this value.
+This variable differs from
+.Sy XBPS_ARCH
+in that it allows you to install packages partially, because
+configuration phase is skipped (the target binaries might not be compatible with
+the native architecture).
+.El
+.Sh FILES
+.Bl -tag -width /var/db/xbps/.<pkgname>-files.plist
+.It Ar /etc/xbps.d
+Default configuration directory.
+.It Ar /usr/share/xbps.d
+Default system configuration directory.
+.It Ar /var/db/xbps/.<pkgname>-files.plist
+Package files metadata.
+.It Ar /var/db/xbps/pkgdb-0.38.plist
+Default package database (0.38 format). Keeps track of installed packages and properties.
+.It Ar /var/cache/xbps
+Default cache directory to store downloaded binary packages.
+.El
+.Sh SEE ALSO
+.Xr xbps-alternatives 1 ,
+.Xr xbps-checkvers 1 ,
+.Xr xbps-create 1 ,
+.Xr xbps-dgraph 1 ,
+.Xr xbps-digest 1 ,
+.Xr xbps-fbulk 1 ,
+.Xr xbps-fetch 1 ,
+.Xr xbps-install 1 ,
+.Xr xbps-pkgdb 1 ,
+.Xr xbps-reconfigure 1 ,
+.Xr xbps-remove 1 ,
+.Xr xbps-rindex 1 ,
+.Xr xbps-uchroot 1 ,
+.Xr xbps-uunshare 1 ,
+.Xr xbps.d 5
+.Sh AUTHORS
+.An Juan Romero Pardines Aq Mt xtraeme@gmail.com
+.Sh BUGS
+Probably, but I try to make this not happen.
+Use it under your own responsibility and enjoy your life.
+.Pp
+Report bugs at
+.Lk https://github.com/void-linux/xbps/issues
