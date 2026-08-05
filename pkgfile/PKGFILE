@@ -3,7 +3,7 @@
 pkgname=voidbr-xbps
 pkgdesc="XBPS package system utilities support hooks"
 pkgver=0.60.7
-pkgrel=8
+pkgrel=9
 provides=(xbps libxbps)       # "eu SOU o xbps/libxbps, pra quem depender deles"
 replaces=(xbps libxbps)       # "remove o xbps/libxbps antigo automaticamente quando eu instalar"
 conflicts=(xbps libxbps)      # "nunca me deixe coexistir com o xbps/libxbps original"
