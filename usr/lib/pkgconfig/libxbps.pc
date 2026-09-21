@@ -1,0 +1,10 @@
+prefix=/usr
+exec_prefix=/usr
+libdir=${exec_prefix}/lib
+includedir=${exec_prefix}/include
+
+Name: XBPS API Library
+Description: The X Binary Package System library
+Version: 0.60.7
+Libs: -lxbps -L${libdir}
+Cflags: -I${includedir}

@@ -1,0 +1,156 @@
+.Dd Feb 9, 2023
+.Dt XBPS-CHECKVERS 1
+.Os
+.Sh NAME
+.Nm xbps-checkvers
+.Nd XBPS utility to check for outdated packages
+.Sh SYNOPSIS
+.Nm
+.Op OPTIONS
+.Op FILES...
+.Sh DESCRIPTION
+The
+.Nm
+utility checks for outdated packages in a target root directory or in
+all registered repositories by comparing the package versions against
+the source package versions available in a
+.Nm void-packages
+tree.
+By default it will use the tree located in
+.Nm ~/void-packages ,
+but this location can be changed with the
+.Fl D, Fl -distdir
+option.
+By default and unless the
+.Fl I, Fl -installed
+option is set, it will use package versions from repositories to compare against
+the
+.Nm void-packages
+tree.
+The
+.Ar FILES
+argument sets extra packages to process with the outdated ones (only processed if missing).
+.Sh OPTIONS
+.Bl -tag -width -x
+.It Fl C, Fl -config Ar dir
+Specifies a path to the XBPS configuration directory.
+If the first character is not '/', then it's a path relative to
+.Ar rootdir .
+.It Fl D, Fl -distdir Ar dir
+Specifies the path to the void-packages tree (usually a git repository). By default set to
+.Nm ~/void-packages .
+.It Fl e, Fl -removed
+List packages present in repos, but not in distdir.
+The source package version will be question mark for them, see documentation for
+.Fl f, Fl -format .
+.It Fl d, Fl -debug
+Enables extra debugging shown to stderr.
+.It Fl f, Fl -format Ar format
+Format according to the string
+.Ar format ,
+inspired by
+.Xr printf 3 .
+.Pp
+The following formatting codes may be used:
+.Bl -tag -width Ds
+.It Cm \en
+Newline.
+.It Cm \et
+Tab.
+.It Cm \e0
+NULL.
+.It Cm \&%%
+A plain
+.Sq Li \&% .
+.It Cm \&%n
+The package name.
+.It Cm \&%r
+The package version from repositories or pkgdb (returns ? if not found).
+.It Cm \&%s
+The source package version (returns ? if not found).
+.It Cm \&%t
+The requested template name (this can be a sub package).
+.It Cm \&%R
+The repository url (returns ? if not found).
+.El
+.Pp
+The default format is
+.Dq Cm "%n %r %s %t %R" .
+.It Fl h, Fl -help
+Show the help message.
+.It Fl i, Fl -ignore-conf-repos
+Ignore repositories defined in configuration files.
+Only repositories specified in the command line via
+.Ar --repository
+will be used.
+.It Fl I, Fl -installed
+Check for outdated installed packages rather than in repositories.
+.It Fl m, Fl -manual
+Only process listed packages.
+.It Fl R, Fl -repository=uri
+Repository to be added to the top of the list. This option can be specified multiple times.
+.It Fl r, Fl -rootdir Ar dir
+Specifies a full path for the target root directory.
+.It Fl s, Fl -show-all
+List all packages found in the
+.Nm void-packages
+tree and prints version available in repository and srcpkgs with the following format:
+.Ar pkgname repover srcver .
+If any version can't be resolved,
+.Em ?
+is printed instead.
+.It Fl -staging
+Enables the use of staged packages from remote repositories.
+.It Fl V, Fl -version
+Show the version information.
+.El
+.Sh EXIT STATUS
+.Ex
+A descriptive error message will be printed to stderr.
+.Sh EXAMPLES
+Show all packages in
+.Pa ~/void-packages ,
+listing the repository version and the
+.Pa srcpkgs
+version:
+.Pp
+.Dl $ xbps-checkvers -s
+.Pp
+Show packages in
+.Pa ~/src/void-packages
+which have a newer version than the installed version:
+.Pp
+.Dl $ xbps-checkvers -D ~/src/void-packages -I
+.Pp
+Check whether installed package
+.Sq foo
+has a newer version in the
+.Nm void-packages
+tree:
+.Pp
+.Dl $ xbps-checkvers -I -m foo
+.Sh SEE ALSO
+.Xr xbps-alternatives 1 ,
+.Xr xbps-create 1 ,
+.Xr xbps-dgraph 1 ,
+.Xr xbps-digest 1 ,
+.Xr xbps-fbulk 1 ,
+.Xr xbps-fetch 1 ,
+.Xr xbps-install 1 ,
+.Xr xbps-pkgdb 1 ,
+.Xr xbps-query 1 ,
+.Xr xbps-reconfigure 1 ,
+.Xr xbps-rindex 1 ,
+.Xr xbps-uchroot 1 ,
+.Xr xbps-uunshare 1 ,
+.Xr xbps.d 5
+.Sh AUTHORS
+.An Dave Elusive Aq Mt davehome@redthumb.info.tm
+.An Juan Romero Pardines Aq Mt xtraeme@gmail.com
+.An Duncan Overbruck Aq Mt mail@duncano.de
+.Sh BUGS
+Probably, but I try to make this not happen. Use it under your own
+responsibility and enjoy your life.
+.Pp
+Report bugs at
+.Lk https://github.com/void-linux/xbps/issues
