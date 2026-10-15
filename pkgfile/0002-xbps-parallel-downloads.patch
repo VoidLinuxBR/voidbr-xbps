@@ -12,7 +12,7 @@ index e7933d2..9ad89c9 100644
  /* from state_cb.c */
  int	state_cb(const struct xbps_state_cb_data *, void *);
 diff --git a/bin/xbps-install/fetch_cb.c b/bin/xbps-install/fetch_cb.c
-index f9860fe..c8fabfa 100644
+index f9860fe..de30348 100644
 --- a/bin/xbps-install/fetch_cb.c
 +++ b/bin/xbps-install/fetch_cb.c
 @@ -30,6 +30,7 @@
@@ -31,19 +31,25 @@ index f9860fe..c8fabfa 100644
  #include <time.h>
  #include <unistd.h>
  
-@@ -183,12 +185,460 @@ stat_display(const struct xbps_fetch_cb_data *xfpd, void *cbdata)
+@@ -183,12 +185,476 @@ stat_display(const struct xbps_fetch_cb_data *xfpd, void *cbdata)
  	}
  }
  
 +/*
 + * VoidBR progress bar, shared by the download and the integrity check
 + * displays:
-+ *   UTF-8 terminal:  [████████████░░░░░░░░]  filled in green, the
-+ *                    leading block in yellow, the rest in gray
-+ *   NO_COLOR set:    same blocks, no colors (https://no-color.org)
-+ *   no UTF-8:        [############--------]  plain ASCII
-+ * "█" and "░" are in the Linux console fonts too (they come from the
-+ * old CP437 table), unlike "━" or "■".
++ *
++ *   [■■■■■■■■■■■■|□□□□□□□]
++ *
++ * Every completed step is a square; the leading cell is a spinner
++ * (| / - \) that keeps turning while there is work going on. Spinner
++ * frames come from a monotonic clock (~150ms each), so every bar on
++ * screen turns in sync, however often it is redrawn. At 100% the
++ * spinner is gone and the bar is all squares.
++ *
++ * Colors: squares in green, spinner in yellow, the rest in gray;
++ * disabled by NO_COLOR (https://no-color.org) or TERM=dumb.
++ * Without a UTF-8 locale the squares become "#" and "-".
 + */
 +static const char *green = "\033[32m";
 +static const char *yellow = "\033[33m";
@@ -77,13 +83,25 @@ index f9860fe..c8fabfa 100644
 +	return term == NULL || strcmp(term, "dumb") != 0;
 +}
 +
++static unsigned int
++bar_frame(void)
++{
++	struct timeval tv;
++
++	get_time(&tv);
++	return (unsigned int)((tv.tv_sec * 1000 + tv.tv_usec / 1000) / 150);
++}
++
 +void
 +progress_bar(char *buf, size_t len, int width, int pct)
 +{
++	static const char spin[] = "|/-\\";
 +	static int utf8 = -1, color = -1;
-+	const char *cur = NULL;
++	const char *cur = NULL, *c, *glyph;
++	char tip[2] = { 0, 0 };
 +	size_t off = 0;
 +	int fill, i;
++	bool done;
 +
 +#define BAR_PUT(s) do { \
 +		size_t l_ = strlen(s); \
@@ -101,29 +119,27 @@ index f9860fe..c8fabfa 100644
 +	if (pct > 100)
 +		pct = 100;
 +	fill = width * pct / 100;
++	done = fill >= width;
++	tip[0] = spin[bar_frame() % 4];
 +
-+	if (!utf8) {
-+		for (i = 0; i < width; i++)
-+			BAR_PUT(i < fill ? "#" : "-");
-+		buf[off] = '\0';
-+		return;
-+	}
 +	for (i = 0; i < width; i++) {
-+		if (color) {
-+			const char *c;
-+
-+			if (i >= fill)
-+				c = gray;
-+			else if (i == fill - 1 && fill < width)
-+				c = yellow;	/* leading block */
-+			else
-+				c = green;
-+			if (c != cur) {
-+				BAR_PUT(c);
-+				cur = c;
-+			}
++		if (i < fill) {
++			/* completed step */
++			glyph = utf8 ? "■" : "#";
++			c = green;
++		} else if (i == fill && !done) {
++			/* working: spinner at the leading cell */
++			glyph = tip;
++			c = yellow;
++		} else {
++			glyph = utf8 ? "□" : "-";
++			c = gray;
 +		}
-+		BAR_PUT(i < fill ? "█" : "░");
++		if (color && c != cur) {
++			BAR_PUT(c);
++			cur = c;
++		}
++		BAR_PUT(glyph);
 +	}
 +	if (color)
 +		BAR_PUT(reset);
