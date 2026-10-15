@@ -11,9 +11,29 @@ arch=('any')
 license=('MIT')
 #url="ssh://git@github.com/voidlinuxbr/${pkgname}"
 url="https://github.com/voidlinuxbr/${pkgname}"
-source=("git+${url}.git")
-md5sums=('SKIP')
-makedepends=()
+
+# commit do xbps upstream em que os patches foram testados
+# (para acompanhar o master, troque por: "xbps::git+https://github.com/void-linux/xbps.git")
+_xbps_commit=c5f41d5b
+# patches aplicados em ordem (o 0002 depende do 0001); ficam em pkgfile/, ao lado deste PKGFILE
+_patches=(
+	0001-xbps-hooks-support.patch
+	0002-xbps-parallel-downloads.patch
+)
+source=(
+	"xbps::git+https://github.com/void-linux/xbps.git#commit=${_xbps_commit}"
+	"git+${url}.git"
+	"${_patches[@]}"
+)
+md5sums=('SKIP' 'SKIP' 'SKIP' 'SKIP')
+
+makedepends=(
+	git
+	pkg-config
+	libarchive-devel
+	openssl-devel
+	zlib-devel
+)
 depends=(
 	ca-certificates
 	xbps-triggers
@@ -22,33 +42,55 @@ depends=(
 	libcrypto3
 	libssl3
 )
-backup=('etc/xbps.d/xbps.conf')
+# caminho absoluto: é assim que o xbps-create compara os conf_files
+backup=('/etc/xbps.d/xbps.conf')
+
+prepare() {
+	cd "${srcdir}/xbps" || die "falha ao entrar em ${srcdir}/xbps"
+
+	for p in "${_patches[@]}"; do
+		# validar que aplica limpo (não muda nada ainda)
+		git apply --check "${srcdir}/${p}" ||
+			die "falha ao aplicar o patch ${p}"
+		msg "OK, ${p} aplica limpo"
+
+		# aplicar de verdade
+		git apply "${srcdir}/${p}" ||
+			die "falha ao aplicar o patch ${p}"
+	done
+}
+
+build() {
+	cd "${srcdir}/xbps" || return 1
+	./configure --enable-rpath --prefix=/usr --sysconfdir=/etc || return 1
+	make -j"$(nproc)"
+}
 
 package() {
-	# Verify default folder
-	if [ -d "${srcdir}/${pkgname}/${pkgname}" ]; then
-		InternalDir="${srcdir}/${pkgname}/${pkgname}"
-	else
-		InternalDir="${srcdir}/${pkgname}"
-	fi
+	local _voidbr="${srcdir}/${pkgname}"
 
-	cd "${srcdir}/${pkgname}"
-	# Copiar a estrutura de /etc, /usr e /opt para /
-	local dirs=("boot" "etc" "opt" "usr" "var")
-	for dir in "${dirs[@]}"; do
-		if [ -d "${InternalDir}/${dir}" ]; then
-			cp -a "${InternalDir}/${dir}" "${pkgdir}/"
-		fi
+	cd "${srcdir}/xbps" || return 1
+	make DESTDIR="${pkgdir}" install || return 1
+
+	# configuração do VoidBR (paralleldownloads=5 ativo em /etc, exemplo documentado em /usr/share)
+	install -Dm644 "${_voidbr}/etc/xbps.d/xbps.conf" "${pkgdir}/etc/xbps.d/xbps.conf"
+	install -Dm644 "${_voidbr}/usr/share/xbps.d/xbps.conf" "${pkgdir}/usr/share/xbps.d/xbps.conf"
+
+	# chaves públicas dos repositórios do VoidBR
+	local key
+	for key in "${_voidbr}"/var/db/xbps/keys/*.plist; do
+		[ -f "$key" ] || continue
+		install -Dm644 "$key" "${pkgdir}/var/db/xbps/keys/${key##*/}"
 	done
 
 	# Install license file if present
-	if [ -f "LICENSE" ]; then
-		install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+	if [ -f "${_voidbr}/LICENSE" ]; then
+		install -Dm644 "${_voidbr}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 	fi
 
 	# Install documentation if present
-	if [ -f "README.md" ]; then
-		install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+	if [ -f "${_voidbr}/README.md" ]; then
+		install -Dm644 "${_voidbr}/README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
 	fi
 }
 

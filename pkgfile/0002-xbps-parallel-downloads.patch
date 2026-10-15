@@ -1,0 +1,1114 @@
+diff --git a/bin/xbps-install/defs.h b/bin/xbps-install/defs.h
+index e7933d2..5790391 100644
+--- a/bin/xbps-install/defs.h
++++ b/bin/xbps-install/defs.h
+@@ -58,6 +58,7 @@ bool	noyes(const char *, ...);
+ 
+ /* from fetch_cb.c */
+ void	fetch_file_progress_cb(const struct xbps_fetch_cb_data *, void *);
++void	fetch_parallel_finish(struct xbps_handle *);
+ 
+ /* from state_cb.c */
+ int	state_cb(const struct xbps_state_cb_data *, void *);
+diff --git a/bin/xbps-install/fetch_cb.c b/bin/xbps-install/fetch_cb.c
+index f9860fe..5b00398 100644
+--- a/bin/xbps-install/fetch_cb.c
++++ b/bin/xbps-install/fetch_cb.c
+@@ -30,6 +30,7 @@
+  * $FreeBSD: src/usr.bin/fetch/fetch.c,v 1.84.2.1 2009/08/03 08:13:06 kensmith Exp $
+  */
+ 
++#include <sys/ioctl.h>
+ #include <sys/param.h>
+ #include <sys/stat.h>
+ #include <sys/time.h>
+@@ -183,12 +184,367 @@ stat_display(const struct xbps_fetch_cb_data *xfpd, void *cbdata)
+ 	}
+ }
+ 
++/*
++ * Parallel downloads (see lib/transaction_fetch.c): pacman-style
++ * display with one line per transfer in flight plus a "Total" line,
++ * redrawn in place when stderr is a terminal. libxbps serializes
++ * every callback, so no locking is needed here.
++ */
++struct pslot {
++	char *file;
++	char label[256];
++	off_t size;
++	off_t offset;
++	off_t dloaded;
++	struct timeval start;
++	bool finished;
++};
++
++static struct {
++	struct pslot *slots;
++	size_t nslots;
++	unsigned int drawn;
++	unsigned int done_pkgs;
++	uint64_t done_bytes;
++	struct timeval start;
++	struct timeval lastdraw;
++	bool open;
++	bool fancy;
++} par;
++
++static double
++tv_secs(const struct timeval *tv)
++{
++	return (double)tv->tv_sec + (double)tv->tv_usec / 1.e6;
++}
++
++/*
++ * Same condition libxbps uses to download in parallel: more than one
++ * package to fetch in a transaction and paralleldownloads > 1.
++ * Anything else (repository sync, xbps-fetch, a single package) keeps
++ * the classic one-file-at-a-time display.
++ */
++static bool
++is_parallel(const struct xbps_fetch_cb_data *xfpd)
++{
++	uint32_t n = 0;
++
++	if (xfpd->xhp == NULL || xfpd->xhp->paralleldownloads < 2 ||
++	    xfpd->xhp->transd == NULL)
++		return false;
++	return xbps_dictionary_get_uint32(xfpd->xhp->transd,
++	    "total-download-pkgs", &n) && n > 1;
++}
++
++static bool
++ends_with(const char *s, const char *suffix)
++{
++	size_t ls = strlen(s), lx = strlen(suffix);
++
++	return ls >= lx && strcmp(s + ls - lx, suffix) == 0;
++}
++
++/* "foo-1.2_1.x86_64.xbps" -> "foo-1.2_1" */
++static void
++make_label(char *dst, size_t dstlen, const char *file)
++{
++	const char *base = strrchr(file, '/');
++	char *dot;
++
++	xbps_strlcpy(dst, base ? base + 1 : file, dstlen);
++	if (ends_with(dst, ".xbps")) {
++		dst[strlen(dst) - 5] = '\0';
++		if ((dot = strrchr(dst, '.')) != NULL)
++			*dot = '\0';
++	}
++}
++
++static void
++fmt_time(char *buf, size_t len, double secs)
++{
++	long t = (long)secs;
++
++	if (secs < 0 || t > 5999)
++		snprintf(buf, len, "--:--");
++	else
++		snprintf(buf, len, "%02u:%02u", (unsigned)(t / 60) % 100u,
++		    (unsigned)(t % 60));
++}
++
++static int
++term_cols(void)
++{
++	struct winsize ws;
++
++	if (ioctl(STDERR_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
++		return ws.ws_col;
++	return 80;
++}
++
++/*
++ * One pacman-like line:
++ *  label                        12MB  1024KB/s 00:05 [######--------]  45%
++ */
++static void
++par_print_line(const char *label, off_t total, off_t done, double bps,
++		double secs, int cols)
++{
++	char sz[8], rate[16], tm[8], bar[64];
++	int barw = 20, namew, pct, fill, i;
++
++	if (total > 0) {
++		pct = (int)((double)done * 100.0 / (double)total);
++		if (pct > 100)
++			pct = 100;
++		(void)xbps_humanize_number(sz, (int64_t)total);
++	} else {
++		pct = 0;
++		snprintf(sz, sizeof sz, "?");
++	}
++	if (bps > 0) {
++		char h[8];
++		(void)xbps_humanize_number(h, (int64_t)bps);
++		snprintf(rate, sizeof rate, "%s/s", h);
++	} else {
++		snprintf(rate, sizeof rate, "--");
++	}
++	fmt_time(tm, sizeof tm, secs);
++
++	/* " " + name + " " + right part (7+1+10+1+5+1+[bar]+1+4) */
++	namew = cols - 1 - (32 + barw) - 1;
++	if (namew < 16) {
++		barw = 10;
++		namew = cols - 1 - (32 + barw) - 1;
++	}
++	if (namew < 8)
++		namew = 8;
++
++	fill = barw * pct / 100;
++	for (i = 0; i < barw; i++)
++		bar[i] = i < fill ? '#' : '-';
++	bar[barw] = '\0';
++
++	fprintf(stderr, " %-*.*s %7s %10s %5s [%s] %3d%%\033[K\n",
++	    namew, namew, label, sz, rate, tm, bar, pct);
++}
++
++static void
++par_redraw(const struct xbps_fetch_cb_data *xfpd, bool force, bool final)
++{
++	struct timeval now;
++	uint64_t total_size = 0, done;
++	uint32_t total_pkgs = 0;
++	double elapsed, bps, eta;
++	char label[64];
++	size_t i, j;
++	int cols;
++
++	get_time(&now);
++	if (!force && tv_secs(&now) - tv_secs(&par.lastdraw) < 0.2)
++		return;
++	par.lastdraw = now;
++	cols = term_cols();
++
++	if (par.drawn > 0)
++		fprintf(stderr, "\033[%uA", par.drawn);
++
++	/* finished transfers scroll up and stay on screen */
++	for (i = j = 0; i < par.nslots; i++) {
++		struct pslot *sl = &par.slots[i];
++
++		if (sl->finished) {
++			elapsed = tv_secs(&now) - tv_secs(&sl->start);
++			bps = elapsed > 0 ? (double)(sl->dloaded - sl->offset) / elapsed : 0;
++			par_print_line(sl->label, sl->size, sl->size, bps, elapsed, cols);
++			free(sl->file);
++			continue;
++		}
++		par.slots[j++] = *sl;
++	}
++	par.nslots = j;
++
++	/* transfers in flight */
++	for (i = 0; i < par.nslots; i++) {
++		struct pslot *sl = &par.slots[i];
++
++		elapsed = tv_secs(&now) - tv_secs(&sl->start);
++		bps = elapsed > 0 ? (double)(sl->dloaded - sl->offset) / elapsed : 0;
++		eta = (bps > 0 && sl->size > 0) ?
++		    (double)(sl->size - sl->dloaded) / bps : -1;
++		par_print_line(sl->label, sl->size, sl->dloaded, bps, eta, cols);
++	}
++
++	/* total */
++	if (xfpd->xhp->transd != NULL) {
++		xbps_dictionary_get_uint64(xfpd->xhp->transd,
++		    "total-download-size", &total_size);
++		xbps_dictionary_get_uint32(xfpd->xhp->transd,
++		    "total-download-pkgs", &total_pkgs);
++	}
++	done = par.done_bytes;
++	for (i = 0; i < par.nslots; i++)
++		done += (uint64_t)par.slots[i].dloaded;
++	if (total_size > 0 && done > total_size)
++		done = total_size;
++	elapsed = tv_secs(&now) - tv_secs(&par.start);
++	bps = elapsed > 0 ? (double)done / elapsed : 0;
++	if (final)
++		eta = elapsed;
++	else
++		eta = (bps > 0 && total_size > done) ?
++		    (double)(total_size - done) / bps : -1;
++	snprintf(label, sizeof label, "Total (%u/%u)", par.done_pkgs,
++	    total_pkgs ? total_pkgs : par.done_pkgs);
++	par_print_line(label, (off_t)total_size, (off_t)(final ? total_size : done),
++	    bps, eta, cols);
++
++	fprintf(stderr, "\033[J");
++	fflush(stderr);
++	par.drawn = final ? 0 : (unsigned int)par.nslots + 1;
++}
++
++static struct pslot *
++par_find(const char *file)
++{
++	for (size_t i = 0; i < par.nslots; i++)
++		if (!par.slots[i].finished && strcmp(par.slots[i].file, file) == 0)
++			return &par.slots[i];
++	return NULL;
++}
++
++static void
++par_reset(void)
++{
++	for (size_t i = 0; i < par.nslots; i++)
++		free(par.slots[i].file);
++	free(par.slots);
++	memset(&par, 0, sizeof par);
++}
++
++static void
++par_progress_cb(const struct xbps_fetch_cb_data *xfpd)
++{
++	struct pslot *sl, *n;
++	uint32_t total_pkgs = 0;
++
++	/* signatures are tiny, keep the display about the packages */
++	if (ends_with(xfpd->file_name, ".sig2") ||
++	    ends_with(xfpd->file_name, ".sig"))
++		return;
++
++	if (!par.open) {
++		par.open = true;
++		par.fancy = isatty(STDERR_FILENO) &&
++		    !(xfpd->xhp->flags & XBPS_FLAG_DEBUG);
++		get_time(&par.start);
++	}
++
++	if (xfpd->cb_start) {
++		n = realloc(par.slots, (par.nslots + 1) * sizeof(*n));
++		if (n == NULL)
++			return;
++		par.slots = n;
++		sl = &par.slots[par.nslots];
++		memset(sl, 0, sizeof(*sl));
++		if ((sl->file = strdup(xfpd->file_name)) == NULL)
++			return;
++		par.nslots++;
++		make_label(sl->label, sizeof sl->label, xfpd->file_name);
++		sl->size = xfpd->file_size;
++		sl->offset = xfpd->file_offset;
++		sl->dloaded = xfpd->file_dloaded;
++		get_time(&sl->start);
++		if (par.fancy)
++			par_redraw(xfpd, true, false);
++		return;
++	}
++
++	if ((sl = par_find(xfpd->file_name)) == NULL)
++		return;
++
++	if (xfpd->cb_update) {
++		sl->dloaded = xfpd->file_dloaded;
++		if (par.fancy)
++			par_redraw(xfpd, false, false);
++		return;
++	}
++
++	/* cb_end */
++	if (sl->size > 0)
++		sl->dloaded = sl->size;
++	sl->finished = true;
++	par.done_pkgs++;
++	par.done_bytes += (uint64_t)(sl->size > 0 ? sl->size : sl->dloaded);
++
++	if (xfpd->xhp->transd != NULL)
++		xbps_dictionary_get_uint32(xfpd->xhp->transd,
++		    "total-download-pkgs", &total_pkgs);
++
++	if (par.fancy) {
++		bool last = total_pkgs > 0 && par.done_pkgs >= total_pkgs;
++
++		par_redraw(xfpd, true, last);
++		if (last)
++			par_reset();
++	} else {
++		struct timeval now;
++		char size[8], rate[16];
++		double elapsed;
++
++		get_time(&now);
++		elapsed = tv_secs(&now) - tv_secs(&sl->start);
++		(void)xbps_humanize_number(size, (int64_t)sl->dloaded);
++		if (elapsed > 0) {
++			char h[8];
++			(void)xbps_humanize_number(h,
++			    (int64_t)((double)(sl->dloaded - sl->offset) / elapsed));
++			snprintf(rate, sizeof rate, "%s/s", h);
++		} else {
++			snprintf(rate, sizeof rate, "--");
++		}
++		printf("%s: %s [avg rate: %s]\n", sl->label, size, rate);
++		fflush(stdout);
++		free(sl->file);
++		*sl = par.slots[--par.nslots];
++		if (total_pkgs > 0 && par.done_pkgs >= total_pkgs)
++			par_reset();
++	}
++}
++
++/*
++ * Called from the state callback before anything else is printed:
++ * if a parallel download display is still open (e.g. a transfer
++ * failed, or a package was already cached and never reported an
++ * end), close it so later output doesn't land inside the region
++ * that would otherwise be redrawn.
++ */
++void
++fetch_parallel_finish(struct xbps_handle *xhp)
++{
++	struct xbps_fetch_cb_data xfpd;
++
++	if (!par.open)
++		return;
++	if (par.fancy && par.drawn > 0) {
++		memset(&xfpd, 0, sizeof xfpd);
++		xfpd.xhp = xhp;
++		par_redraw(&xfpd, true, false);
++		par.drawn = 0;
++	}
++	par_reset();
++}
++
+ void
+ fetch_file_progress_cb(const struct xbps_fetch_cb_data *xfpd, void *cbdata)
+ {
+ 	struct xferstat *xfer = cbdata;
+ 	char size[8];
+ 
++	if (is_parallel(xfpd)) {
++		par_progress_cb(xfpd);
++		return;
++	}
++
+ 	if (xfpd->cb_start) {
+ 		/* start transfer stats */
+ 		v_tty = isatty(STDOUT_FILENO);
+diff --git a/bin/xbps-install/main.c b/bin/xbps-install/main.c
+index 41c543c..b45fafb 100644
+--- a/bin/xbps-install/main.c
++++ b/bin/xbps-install/main.c
+@@ -64,6 +64,9 @@ usage(bool fail)
+ 	    "                             If specified twice, also remove uninstalled packages\n"
+ 	    "                             If specified three times, remove everything from the cache\n"
+ 	    " -o, --remove-orphans        Remove package orphans\n"
++	    "     --parallel-downloads <n>\n"
++	    "                             Download up to <n> packages at the same time\n"
++	    "                             (overrides `paralleldownloads' in xbps.d)\n"
+ 	    " -R, --repository <url>      Add repository to the top of the list\n"
+ 	    "                             This option can be specified multiple times\n"
+ 	    " -r, --rootdir <dir>         Full path to rootdir\n"
+@@ -129,6 +132,7 @@ main(int argc, char **argv)
+ 		{ "yes", no_argument, NULL, 'y' },
+ 		{ "reproducible", no_argument, NULL, 1 },
+ 		{ "staging", no_argument, NULL, 2 },
++		{ "parallel-downloads", required_argument, NULL, 3 },
+ 		{ NULL, 0, NULL, 0 }
+ 	};
+ 	struct xbps_handle xh;
+@@ -136,7 +140,7 @@ main(int argc, char **argv)
+ 	const char *rootdir, *cachedir, *confdir;
+ 	int i, c, flags, rv, fflag = 0, clean_cache = 0;
+ 	bool syncf, yes, force, drun, update, orphans;
+-	int maxcols, eexist = 0;
++	int maxcols, eexist = 0, pdownloads = 0;
+ 
+ 	rootdir = cachedir = confdir = NULL;
+ 	flags = rv = 0;
+@@ -152,6 +156,22 @@ main(int argc, char **argv)
+ 		case 2:
+ 			flags |= XBPS_FLAG_USE_STAGE;
+ 			break;
++		case 3: {
++			char *endp = NULL;
++			long n;
++
++			errno = 0;
++			n = strtol(optarg, &endp, 10);
++			if (errno != 0 || endp == optarg || *endp != '\0' ||
++			    n < 1 || n > XBPS_PARALLEL_DOWNLOADS_MAX) {
++				xbps_error_printf("invalid --parallel-downloads "
++				    "value `%s' (must be 1-%d)\n", optarg,
++				    XBPS_PARALLEL_DOWNLOADS_MAX);
++				exit(EXIT_FAILURE);
++			}
++			pdownloads = (int)n;
++			break;
++		}
+ 		case 'A':
+ 			flags |= XBPS_FLAG_INSTALL_AUTO;
+ 			break;
+@@ -248,6 +268,9 @@ main(int argc, char **argv)
+ 		    strerror(rv));
+ 		exit(EXIT_FAILURE);
+ 	}
++	/* command line wins over xbps.d(5), which xbps_init() just read */
++	if (pdownloads > 0)
++		xh.paralleldownloads = pdownloads;
+ 
+ 	maxcols = get_maxcols();
+ 
+diff --git a/bin/xbps-install/state_cb.c b/bin/xbps-install/state_cb.c
+index 63fc574..509211b 100644
+--- a/bin/xbps-install/state_cb.c
++++ b/bin/xbps-install/state_cb.c
+@@ -45,6 +45,15 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+ 		openlog("xbps-install", 0, LOG_USER);
+ 	}
+ 
++	/*
++	 * Parallel downloads draw a multi-line progress display; close
++	 * it before printing anything else. Per-file "Downloading ..."
++	 * states come from the download workers themselves and print
++	 * nothing, so they must not close it.
++	 */
++	if (xscd->state != XBPS_STATE_DOWNLOAD)
++		fetch_parallel_finish(xscd->xhp);
++
+ 	switch (xscd->state) {
+ 	/* notifications */
+ 	case XBPS_STATE_TRANS_DOWNLOAD:
+diff --git a/bin/xbps-install/xbps-install.1 b/bin/xbps-install/xbps-install.1
+index 020edff..feeac3d 100644
+--- a/bin/xbps-install/xbps-install.1
++++ b/bin/xbps-install/xbps-install.1
+@@ -138,6 +138,13 @@ for in memory sync.
+ .Pp
+ The output will be a line for each action in the following format:
+ .D1 <pkgver> <action> <arch> <repository> <installedsize> <downloadsize>
++.It Fl -parallel-downloads Ar number
++Download up to
++.Ar number
++binary packages at the same time (1-16), overriding
++.Sy paralleldownloads
++from
++.Xr xbps.d 5 .
+ .It Fl R , Fl -repository Ar url
+ Appends the specified repository to the top of the list.
+ The
+diff --git a/data/xbps.d.5 b/data/xbps.d.5
+index 3c5101b..4279b0f 100644
+--- a/data/xbps.d.5
++++ b/data/xbps.d.5
+@@ -88,6 +88,15 @@ but files that also match the second pattern will still be extracted.
+ Imports settings from the specified configuration file.
+ .Em NOTE
+ only one level of nesting is allowed.
++.It Sy paralleldownloads=number
++Maximum number of binary packages downloaded at the same time during a
++transaction, between 1 and 16.
++The default is 1, one package at a time.
++Package signatures are always verified after all downloads have finished.
++Can be overridden with the
++.Fl -parallel-downloads
++option of
++.Xr xbps-install 1 .
+ .It Sy preserve=path
+ If set ignores modifications to the specified files, while unpacking packages.
+ Absolute path to a file and file globbing are supported, example:
+diff --git a/include/xbps.h.in b/include/xbps.h.in
+index f285c7b..9b30bcc 100644
+--- a/include/xbps.h.in
++++ b/include/xbps.h.in
+@@ -264,6 +264,12 @@
+  */
+ #define XBPS_FETCH_CACHECONN_HOST       16
+ 
++/**
++ * @def XBPS_PARALLEL_DOWNLOADS_MAX
++ * Upper bound accepted for struct xbps_handle::paralleldownloads.
++ */
++#define XBPS_PARALLEL_DOWNLOADS_MAX	XBPS_FETCH_CACHECONN_HOST
++
+ /**
+  * @def XBPS_FETCH_TIMEOUT
+  * Default timeout limit (in seconds) to wait for stalled connections.
+@@ -695,6 +701,15 @@ struct xbps_handle {
+ 	 * 	- XBPS_FLAG_* (see above)
+ 	 */
+ 	int flags;
++	/**
++	 * @var paralleldownloads
++	 *
++	 * Maximum number of binary packages downloaded at the same time
++	 * by a transaction. 0 or 1 means one at a time (the historical
++	 * behavior). Set from the "paralleldownloads" keyword in
++	 * xbps.d(5); frontends may override it after xbps_init().
++	 */
++	int paralleldownloads;
+ };
+ 
+ /**
+diff --git a/lib/cb_util.c b/lib/cb_util.c
+index a867fb6..540a296 100644
+--- a/lib/cb_util.c
++++ b/lib/cb_util.c
+@@ -28,9 +28,45 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <stdarg.h>
++#include <pthread.h>
+ 
+ #include "xbps_api_impl.h"
+ 
++/*
++ * Frontend callbacks are not required to be thread-safe, but
++ * packages may be downloaded by several threads at once (see
++ * lib/transaction_fetch.c). Serialize every callback invocation
++ * through one lock so frontends never see two of them at the same
++ * time. Recursive, because a callback is free to call back into
++ * libxbps, which may itself report state through these functions.
++ */
++static pthread_mutex_t cb_mtx;
++static pthread_once_t cb_mtx_once = PTHREAD_ONCE_INIT;
++
++static void
++cb_mtx_init(void)
++{
++	pthread_mutexattr_t attr;
++
++	pthread_mutexattr_init(&attr);
++	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
++	pthread_mutex_init(&cb_mtx, &attr);
++	pthread_mutexattr_destroy(&attr);
++}
++
++static void
++cb_lock(void)
++{
++	pthread_once(&cb_mtx_once, cb_mtx_init);
++	pthread_mutex_lock(&cb_mtx);
++}
++
++static void
++cb_unlock(void)
++{
++	pthread_mutex_unlock(&cb_mtx);
++}
++
+ void HIDDEN
+ xbps_set_cb_fetch(struct xbps_handle *xhp,
+ 		  off_t file_size,
+@@ -54,7 +90,9 @@ xbps_set_cb_fetch(struct xbps_handle *xhp,
+ 	xfcd.cb_start = cb_start;
+ 	xfcd.cb_update = cb_update;
+ 	xfcd.cb_end = cb_end;
++	cb_lock();
+ 	(*xhp->fetch_cb)(&xfcd, xhp->fetch_cb_data);
++	cb_unlock();
+ }
+ 
+ int HIDDEN PRINTF_LIKE(5, 6)
+@@ -86,7 +124,9 @@ xbps_set_cb_state(struct xbps_handle *xhp,
+ 		else
+ 			xscd.desc = buf;
+ 	}
++	cb_lock();
+ 	retval = (*xhp->state_cb)(&xscd, xhp->state_cb_data);
++	cb_unlock();
+ 	if (buf != NULL)
+ 		free(buf);
+ 
+diff --git a/lib/conf.c b/lib/conf.c
+index 4ac1dab..2e7488d 100644
+--- a/lib/conf.c
++++ b/lib/conf.c
+@@ -207,6 +207,7 @@ enum {
+ 	KEY_IGNOREPKG,
+ 	KEY_INCLUDE,
+ 	KEY_NOEXTRACT,
++	KEY_PARALLELDOWNLOADS,
+ 	KEY_PRESERVE,
+ 	KEY_REPOSITORY,
+ 	KEY_ROOTDIR,
+@@ -228,6 +229,7 @@ static const struct key {
+ 	{ "include",       7, KEY_INCLUDE },
+ 	{ "keepconf",      8, KEY_KEEPCONF },
+ 	{ "noextract",     9, KEY_NOEXTRACT },
++	{ "paralleldownloads", 17, KEY_PARALLELDOWNLOADS },
+ 	{ "preserve",      8, KEY_PRESERVE },
+ 	{ "repository",   10, KEY_REPOSITORY },
+ 	{ "rootdir",       7, KEY_ROOTDIR },
+@@ -448,6 +450,23 @@ parse_file(struct xbps_handle *xhp, const char *path, bool nested)
+ 		case KEY_IGNOREPKG:
+ 			store_ignored_pkg(xhp, val);
+ 			break;
++		case KEY_PARALLELDOWNLOADS: {
++			char *endp = NULL;
++			long n;
++
++			errno = 0;
++			n = strtol(val, &endp, 10);
++			if (errno != 0 || endp == val || *endp != '\0' ||
++			    n < 1 || n > XBPS_PARALLEL_DOWNLOADS_MAX) {
++				xbps_dbg_printf("%s: ignoring invalid paralleldownloads "
++				    "value `%s' (must be 1-%d)\n", path, val,
++				    XBPS_PARALLEL_DOWNLOADS_MAX);
++				break;
++			}
++			xhp->paralleldownloads = (int)n;
++			xbps_dbg_printf("%s: parallel downloads set to %ld\n", path, n);
++			break;
++		}
+ 		case KEY_NOEXTRACT:
+ 			store_noextract(xhp, val);
+ 			break;
+diff --git a/lib/download.c b/lib/download.c
+index a9a5253..38fc2ab 100644
+--- a/lib/download.c
++++ b/lib/download.c
+@@ -61,7 +61,7 @@ static const char *
+ print_time(time_t *t)
+ {
+ 	struct tm tm;
+-	static char buf[255];
++	static __thread char buf[255];
+ 
+ 	gmtime_r(t, &tm);
+ 	strftime(buf, sizeof(buf), "%d %b %Y %H:%M", &tm);
+diff --git a/lib/fetch/common.c b/lib/fetch/common.c
+index 39dcd8d..dd5d0b0 100644
+--- a/lib/fetch/common.c
++++ b/lib/fetch/common.c
+@@ -424,16 +424,18 @@ fetch_socks5(conn_t *conn, struct url *url, struct url *socks, int verbose)
+ 	return 0;
+ }
+ 
+-static int
+-get_conn_timeout(void)
++/*
++ * Computed once per process; pthread_once() because packages may be
++ * downloaded by several threads at the same time.
++ */
++static int conn_timeout_result;
++static pthread_once_t conn_timeout_once = PTHREAD_ONCE_INIT;
++
++static void
++conn_timeout_init(void)
+ {
+-	static int result = -2;
+ 	char *conn_timeout;
+ 
+-	if (result != -2) {
+-		return result;
+-	}
+-
+ 	conn_timeout = getenv("CONNECTION_TIMEOUT");
+ 	if (conn_timeout) {
+ 		char *char_read = conn_timeout;
+@@ -441,12 +443,17 @@ get_conn_timeout(void)
+ 		if (from_env < -1 || char_read == conn_timeout) {
+ 			from_env = fetchConnTimeout;
+ 		}
+-		result = from_env > INT_MAX ? INT_MAX: from_env;
++		conn_timeout_result = from_env > INT_MAX ? INT_MAX: from_env;
+ 	} else {
+-		result = fetchConnTimeout;
++		conn_timeout_result = fetchConnTimeout;
+ 	}
++}
+ 
+-	return result;
++static int
++get_conn_timeout(void)
++{
++	pthread_once(&conn_timeout_once, conn_timeout_init);
++	return conn_timeout_result;
+ }
+ 
+ /*
+@@ -477,7 +484,7 @@ get_conn_timeout(void)
+ static int
+ happy_eyeballs_connect(struct addrinfo *res0, int verbose)
+ {
+-	static int unreach = 0;
++	static __thread int unreach = 0;
+ 	int connTimeout = get_conn_timeout();
+ 	struct pollfd *pfd;
+ 	struct addrinfo *res;
+@@ -1880,7 +1887,7 @@ fetchFreeURLList(struct url_list *ue)
+ static const char *
+ fetch_read_word(FILE *f)
+ {
+-	static char word[1024];
++	static __thread char word[1024];
+ 
+ 	if (fscanf(f, " %1023s ", word) != 1)
+ 		return (NULL);
+diff --git a/lib/fetch/fetch.c b/lib/fetch/fetch.c
+index b07c21b..33f93d8 100644
+--- a/lib/fetch/fetch.c
++++ b/lib/fetch/fetch.c
+@@ -42,8 +42,12 @@
+ #include "common.h"
+ 
+ auth_t	 fetchAuthMethod;
+-int	 fetchLastErrCode;
+-char	 fetchLastErrString[MAXERRSTRING];
++/*
++ * Per-thread, so concurrent transfers (see lib/transaction_fetch.c)
++ * never see each other's error state.
++ */
++__thread int	 fetchLastErrCode;
++__thread char	 fetchLastErrString[MAXERRSTRING];
+ int	 fetchTimeout;
+ int	 fetchConnTimeout = 300 * 1000;
+ int	 fetchConnDelay = 250;
+diff --git a/lib/fetch/fetch.h b/lib/fetch/fetch.h
+index f1b9d08..2d17f56 100644
+--- a/lib/fetch/fetch.h
++++ b/lib/fetch/fetch.h
+@@ -164,9 +164,9 @@ typedef int (*auth_t)(struct url *);
+ extern auth_t		 fetchAuthMethod;
+ 
+ /* Last error code */
+-extern int		 fetchLastErrCode;
++extern __thread int	 fetchLastErrCode;
+ #define MAXERRSTRING 256
+-extern char		 fetchLastErrString[MAXERRSTRING];
++extern __thread char	 fetchLastErrString[MAXERRSTRING];
+ 
+ /* I/O timeout */
+ extern int		 fetchTimeout;
+diff --git a/lib/transaction_fetch.c b/lib/transaction_fetch.c
+index 8d48441..020f40b 100644
+--- a/lib/transaction_fetch.c
++++ b/lib/transaction_fetch.c
+@@ -26,6 +26,8 @@
+ 
+ #include <errno.h>
+ #include <limits.h>
++#include <pthread.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+ 
+@@ -98,22 +100,58 @@ verify_binpkg(struct xbps_handle *xhp, xbps_dictionary_t pkgd)
+ 	return 0;
+ }
+ 
+-static int
+-download_binpkg(struct xbps_handle *xhp, xbps_dictionary_t repo_pkgd)
++/*
++ * Result of downloading one binary package, kept apart from the
++ * signature check so the download can run on a worker thread while
++ * the check (which touches the shared repository pool) always runs
++ * on the calling thread.
++ */
++struct binpkg_fetch {
++	xbps_dictionary_t pkgd;
++	unsigned char digest[XBPS_SHA256_DIGEST_SIZE];
++	bool unchanged;		/* server said 304: verify the file instead */
++	bool done;		/* download attempted and finished */
++	int rv;
++	char errstr[256];	/* fetch error text, copied from the worker */
++	bool sigfail;		/* rv refers to the .sig2 download */
++};
++
++static void
++fetch_report_failure(struct xbps_handle *xhp, struct binpkg_fetch *bf)
++{
++	const char *pkgver, *repoloc;
++
++	xbps_dictionary_get_cstring_nocopy(bf->pkgd, "pkgver", &pkgver);
++	xbps_dictionary_get_cstring_nocopy(bf->pkgd, "repository", &repoloc);
++	xbps_set_cb_state(xhp, XBPS_STATE_DOWNLOAD_FAIL, bf->rv,
++	    pkgver, "[trans] failed to download `%s' %s from `%s': %s",
++	    pkgver, bf->sigfail ? "signature" : "package", repoloc,
++	    bf->errstr[0] ? bf->errstr : strerror(bf->rv));
++}
++
++/*
++ * Downloads the signature and the package itself into the cachedir
++ * (the current directory, see xbps_transaction_commit()). Safe to run
++ * concurrently for different packages: libfetch error state is
++ * per-thread and every callback into the frontend is serialized in
++ * lib/cb_util.c. On failure, bf->rv/errstr are filled in but nothing
++ * is reported: the caller does that from its own thread.
++ */
++static void
++fetch_binpkg(struct xbps_handle *xhp, struct binpkg_fetch *bf)
+ {
+-	struct xbps_repo *repo;
+ 	char buf[PATH_MAX];
+ 	char *sigsuffix;
+ 	const char *pkgver, *arch, *fetchstr, *repoloc;
+-	unsigned char digest[XBPS_SHA256_DIGEST_SIZE] = {0};
+-	int rv = 0;
+ 
+-	xbps_dictionary_get_cstring_nocopy(repo_pkgd, "repository", &repoloc);
+-	if (!xbps_repository_is_remote(repoloc))
+-		return ENOTSUP;
++	xbps_dictionary_get_cstring_nocopy(bf->pkgd, "repository", &repoloc);
++	xbps_dictionary_get_cstring_nocopy(bf->pkgd, "pkgver", &pkgver);
++	xbps_dictionary_get_cstring_nocopy(bf->pkgd, "architecture", &arch);
+ 
+-	xbps_dictionary_get_cstring_nocopy(repo_pkgd, "pkgver", &pkgver);
+-	xbps_dictionary_get_cstring_nocopy(repo_pkgd, "architecture", &arch);
++	bf->rv = 0;
++	bf->errstr[0] = '\0';
++	bf->unchanged = false;
++	bf->sigfail = false;
+ 
+ 	snprintf(buf, sizeof buf, "%s/%s.%s.xbps.sig2", repoloc, pkgver, arch);
+ 	sigsuffix = buf+(strlen(buf)-sizeof (".sig2")+1);
+@@ -122,12 +160,11 @@ download_binpkg(struct xbps_handle *xhp, xbps_dictionary_t repo_pkgd)
+ 		"Downloading `%s' signature (from `%s')...", pkgver, repoloc);
+ 
+ 	if (xbps_fetch_file(xhp, buf, NULL) == -1) {
+-		rv = fetchLastErrCode ? fetchLastErrCode : errno;
+-		fetchstr = xbps_fetch_error_string();
+-		xbps_set_cb_state(xhp, XBPS_STATE_DOWNLOAD_FAIL, rv,
+-			pkgver, "[trans] failed to download `%s' signature from `%s': %s",
+-			pkgver, repoloc, fetchstr ? fetchstr : strerror(rv));
+-		return rv;
++		bf->rv = fetchLastErrCode ? fetchLastErrCode : errno;
++		bf->sigfail = true;
++		if ((fetchstr = xbps_fetch_error_string()) != NULL)
++			xbps_strlcpy(bf->errstr, fetchstr, sizeof bf->errstr);
++		goto out;
+ 	}
+ 
+ 	*sigsuffix = '\0';
+@@ -135,14 +172,33 @@ download_binpkg(struct xbps_handle *xhp, xbps_dictionary_t repo_pkgd)
+ 	xbps_set_cb_state(xhp, XBPS_STATE_DOWNLOAD, 0, pkgver,
+ 		"Downloading `%s' package (from `%s')...", pkgver, repoloc);
+ 
+-	if (xbps_fetch_file_sha256(xhp, buf, NULL, digest, sizeof digest) == -1) {
+-		rv = fetchLastErrCode ? fetchLastErrCode : errno;
+-		fetchstr = xbps_fetch_error_string();
+-		xbps_set_cb_state(xhp, XBPS_STATE_DOWNLOAD_FAIL, rv,
+-			pkgver, "[trans] failed to download `%s' package from `%s': %s",
+-			pkgver, repoloc, fetchstr ? fetchstr : strerror(rv));
+-		return rv;
++	if (xbps_fetch_file_sha256(xhp, buf, NULL, bf->digest, sizeof bf->digest) == -1) {
++		bf->rv = fetchLastErrCode ? fetchLastErrCode : errno;
++		if ((fetchstr = xbps_fetch_error_string()) != NULL)
++			xbps_strlcpy(bf->errstr, fetchstr, sizeof bf->errstr);
++		goto out;
+ 	}
++	/*
++	 * If digest is not set, binary package was not downloaded,
++	 * i.e. 304 not modified, verify by file instead.
++	 */
++	bf->unchanged = (fetchLastErrCode == FETCH_UNCHANGED);
++out:
++	bf->done = true;
++}
++
++static int
++check_binpkg_signature(struct xbps_handle *xhp, struct binpkg_fetch *bf)
++{
++	struct xbps_repo *repo;
++	char buf[PATH_MAX];
++	char *sigsuffix;
++	const char *pkgver, *arch, *repoloc;
++	int rv;
++
++	xbps_dictionary_get_cstring_nocopy(bf->pkgd, "repository", &repoloc);
++	xbps_dictionary_get_cstring_nocopy(bf->pkgd, "pkgver", &pkgver);
++	xbps_dictionary_get_cstring_nocopy(bf->pkgd, "architecture", &arch);
+ 
+ 	xbps_set_cb_state(xhp, XBPS_STATE_VERIFY, 0, pkgver,
+ 		"%s: verifying RSA signature...", pkgver);
+@@ -157,12 +213,8 @@ download_binpkg(struct xbps_handle *xhp, xbps_dictionary_t repo_pkgd)
+ 		return rv;
+ 	}
+ 
+-	/*
+-	 * If digest is not set, binary package was not downloaded,
+-	 * i.e. 304 not modified, verify by file instead.
+-	 */
+ 	rv = 0;
+-	if (fetchLastErrCode == FETCH_UNCHANGED) {
++	if (bf->unchanged) {
+ 		*sigsuffix = '\0';
+ 		if (!xbps_verify_file_signature(repo, buf)) {
+ 			rv = EPERM;
+@@ -173,7 +225,7 @@ download_binpkg(struct xbps_handle *xhp, xbps_dictionary_t repo_pkgd)
+ 			(void)remove(buf);
+ 		}
+ 	} else {
+-		if (!xbps_verify_signature(repo, buf, digest)) {
++		if (!xbps_verify_signature(repo, buf, bf->digest)) {
+ 			rv = EPERM;
+ 			/* remove signature */
+ 			(void)remove(buf);
+@@ -193,6 +245,142 @@ download_binpkg(struct xbps_handle *xhp, xbps_dictionary_t repo_pkgd)
+ 	return rv;
+ }
+ 
++static int
++download_binpkg(struct xbps_handle *xhp, xbps_dictionary_t repo_pkgd)
++{
++	struct binpkg_fetch bf;
++	const char *repoloc;
++
++	xbps_dictionary_get_cstring_nocopy(repo_pkgd, "repository", &repoloc);
++	if (!xbps_repository_is_remote(repoloc))
++		return ENOTSUP;
++
++	memset(&bf, 0, sizeof bf);
++	bf.pkgd = repo_pkgd;
++	fetch_binpkg(xhp, &bf);
++	if (bf.rv != 0) {
++		fetch_report_failure(xhp, &bf);
++		return bf.rv;
++	}
++	return check_binpkg_signature(xhp, &bf);
++}
++
++/*
++ * Parallel downloads.
++ *
++ * Workers pull the next pending package off a shared index and only
++ * download it (signature + package + sha256 digest computed while
++ * streaming). Signature checks, failure reports and everything else
++ * that touches shared libxbps state run afterwards on the calling
++ * thread, in transaction order, so the rest of the transaction sees
++ * exactly what the sequential path would have produced.
++ *
++ * On the first failure no new downloads are started; transfers
++ * already in flight are left to finish (their .part files would be
++ * resumed by the next run anyway).
++ */
++struct fetch_pool {
++	struct xbps_handle *xhp;
++	struct binpkg_fetch *jobs;
++	unsigned int njobs;
++	unsigned int next;
++	bool failed;
++	pthread_mutex_t mtx;
++};
++
++static void *
++fetch_worker(void *arg)
++{
++	struct fetch_pool *pool = arg;
++	struct binpkg_fetch *bf;
++
++	for (;;) {
++		pthread_mutex_lock(&pool->mtx);
++		if (pool->failed || pool->next >= pool->njobs) {
++			pthread_mutex_unlock(&pool->mtx);
++			break;
++		}
++		bf = &pool->jobs[pool->next++];
++		pthread_mutex_unlock(&pool->mtx);
++
++		fetch_binpkg(pool->xhp, bf);
++
++		if (bf->rv != 0) {
++			pthread_mutex_lock(&pool->mtx);
++			pool->failed = true;
++			pthread_mutex_unlock(&pool->mtx);
++		}
++	}
++	return NULL;
++}
++
++static int
++download_binpkgs_parallel(struct xbps_handle *xhp, xbps_array_t fetch,
++		unsigned int nthreads)
++{
++	struct fetch_pool pool;
++	pthread_t *thds;
++	unsigned int i, started = 0;
++	int rv = 0;
++
++	memset(&pool, 0, sizeof pool);
++	pool.xhp = xhp;
++	pool.njobs = xbps_array_count(fetch);
++	pool.jobs = calloc(pool.njobs, sizeof(*pool.jobs));
++	thds = calloc(nthreads, sizeof(*thds));
++	if (pool.jobs == NULL || thds == NULL) {
++		free(pool.jobs);
++		free(thds);
++		return ENOMEM;
++	}
++	for (i = 0; i < pool.njobs; i++)
++		pool.jobs[i].pkgd = xbps_array_get(fetch, i);
++	pthread_mutex_init(&pool.mtx, NULL);
++
++	for (i = 0; i < nthreads; i++) {
++		if (pthread_create(&thds[i], NULL, fetch_worker, &pool) != 0)
++			break;
++		started++;
++	}
++	if (started == 0) {
++		/* could not spawn anything: do it ourselves */
++		fetch_worker(&pool);
++	}
++	for (i = 0; i < started; i++)
++		pthread_join(thds[i], NULL);
++
++	pthread_mutex_destroy(&pool.mtx);
++	free(thds);
++
++	/*
++	 * Report the first failure, in transaction order, exactly like
++	 * the sequential path would have.
++	 */
++	for (i = 0; i < pool.njobs; i++) {
++		if (pool.jobs[i].done && pool.jobs[i].rv != 0) {
++			rv = pool.jobs[i].rv;
++			fetch_report_failure(xhp, &pool.jobs[i]);
++			xbps_dbg_printf("[trans] failed to download binpkgs: "
++			    "%s\n", strerror(rv));
++			goto out;
++		}
++	}
++	/*
++	 * Everything is on disk: check the signatures, still in
++	 * transaction order.
++	 */
++	for (i = 0; i < pool.njobs; i++) {
++		if ((rv = check_binpkg_signature(xhp, &pool.jobs[i])) != 0) {
++			xbps_dbg_printf("[trans] failed to verify binpkgs: "
++			    "%s\n", strerror(rv));
++			goto out;
++		}
++	}
++out:
++	free(pool.jobs);
++	return rv;
++}
++
+ int
+ xbps_transaction_fetch(struct xbps_handle *xhp, xbps_object_iterator_t iter)
+ {
+@@ -247,11 +435,24 @@ xbps_transaction_fetch(struct xbps_handle *xhp, xbps_object_iterator_t iter)
+ 		xbps_set_cb_state(xhp, XBPS_STATE_TRANS_DOWNLOAD, 0, NULL, NULL);
+ 		xbps_dbg_printf("[trans] downloading %d packages.\n", n);
+ 	}
+-	for (i = 0; i < n; i++) {
+-		if ((rv = download_binpkg(xhp, xbps_array_get(fetch, i))) != 0) {
+-			xbps_dbg_printf("[trans] failed to download binpkgs: "
+-				"%s\n", strerror(rv));
++	if (n > 1 && xhp->paralleldownloads > 1) {
++		unsigned int nthreads = (unsigned int)xhp->paralleldownloads;
++
++		if (nthreads > XBPS_PARALLEL_DOWNLOADS_MAX)
++			nthreads = XBPS_PARALLEL_DOWNLOADS_MAX;
++		if (nthreads > n)
++			nthreads = n;
++		xbps_dbg_printf("[trans] downloading with %u parallel "
++		    "transfers.\n", nthreads);
++		if ((rv = download_binpkgs_parallel(xhp, fetch, nthreads)) != 0)
+ 			goto out;
++	} else {
++		for (i = 0; i < n; i++) {
++			if ((rv = download_binpkg(xhp, xbps_array_get(fetch, i))) != 0) {
++				xbps_dbg_printf("[trans] failed to download binpkgs: "
++					"%s\n", strerror(rv));
++				goto out;
++			}
+ 		}
+ 	}
+ 
