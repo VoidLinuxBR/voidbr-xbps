@@ -1,0 +1,1711 @@
+diff --git a/bin/xbps-install/Makefile b/bin/xbps-install/Makefile
+index 3526445..201be21 100644
+--- a/bin/xbps-install/Makefile
++++ b/bin/xbps-install/Makefile
+@@ -3,5 +3,21 @@ TOPDIR = ../..
+ 
+ BIN = xbps-install
+ OBJS = main.o transaction.o question.o fetch_cb.o state_cb.o util.o
++OBJS += ../xbps-remove/clean-cache.o
+ 
+ include $(TOPDIR)/mk/prog.mk
++
++# The generic %.o: %.c rule above (from mk/prog.mk) compiles with `-c`
++# and no explicit `-o`, which only produces the right path when the
++# object already exists (built by an earlier, alphabetically-preceding
++# subdirectory) and make skips recompiling it. xbps-remove's own
++# cross-references to ../xbps-install/*.o rely on exactly that
++# ordering accident. Since xbps-install builds *before* xbps-remove
++# alphabetically, the same trick doesn't work in this direction: an
++# explicit rule with a correct -o $@ is needed so the object lands in
++# ../xbps-remove/ instead of here. This must come *after* the
++# mk/prog.mk include, otherwise it becomes the file's first rule and
++# hijacks the default "make" goal away from "all".
++../xbps-remove/clean-cache.o: ../xbps-remove/clean-cache.c
++	@printf " [CC]\t\t$@\n"
++	${SILENT}$(CC) $(CPPFLAGS) $(PROG_CFLAGS) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
+diff --git a/bin/xbps-install/defs.h b/bin/xbps-install/defs.h
+index 34680b2..e7933d2 100644
+--- a/bin/xbps-install/defs.h
++++ b/bin/xbps-install/defs.h
+@@ -49,7 +49,7 @@ struct transaction {
+ /* from transaction.c */
+ int	install_new_pkg(struct xbps_handle *, const char *, bool);
+ int	update_pkg(struct xbps_handle *, const char *, bool);
+-int	dist_upgrade(struct xbps_handle *, unsigned int, bool, bool);
++int	dist_upgrade(struct xbps_handle *, unsigned int, bool, bool, int, char **);
+ int	exec_transaction(struct xbps_handle *, unsigned int, bool, bool);
+ 
+ /* from question.c */
+diff --git a/bin/xbps-install/main.c b/bin/xbps-install/main.c
+index 8f8be81..41c543c 100644
+--- a/bin/xbps-install/main.c
++++ b/bin/xbps-install/main.c
+@@ -36,6 +36,7 @@
+ 
+ #include <xbps.h>
+ #include "defs.h"
++#include "../xbps-remove/defs.h"
+ 
+ static void __attribute__((noreturn))
+ usage(bool fail)
+@@ -49,7 +50,9 @@ usage(bool fail)
+ 	    " -d, --debug                 Debug mode shown to stderr\n"
+ 	    " -D, --download-only         Download packages and check integrity, nothing else\n"
+ 	    " -f, --force                 Force package re-installation\n"
+-	    "                             If specified twice, all files will be overwritten.\n"
++	    "                             If specified twice, all files will be overwritten\n"
++	    "                             and a package explicitly named on the command\n"
++	    "                             line may replace one that conflicts with/replaces it\n"
+ 	    " -h, --help                  Show usage\n"
+ 	    " -i, --ignore-conf-repos     Ignore repositories defined in xbps.d\n"
+ 	    " -I, --ignore-file-conflicts Ignore detected file conflicts\n"
+@@ -57,6 +60,10 @@ usage(bool fail)
+ 	    " -M, --memory-sync           Remote repository data is fetched and stored\n"
+ 	    "                             in memory, ignoring on-disk repodata archives\n"
+ 	    " -n, --dry-run               Dry-run mode\n"
++	    " -O, --clean-cache           Remove outdated packages from the cache\n"
++	    "                             If specified twice, also remove uninstalled packages\n"
++	    "                             If specified three times, remove everything from the cache\n"
++	    " -o, --remove-orphans        Remove package orphans\n"
+ 	    " -R, --repository <url>      Add repository to the top of the list\n"
+ 	    "                             This option can be specified multiple times\n"
+ 	    " -r, --rootdir <dir>         Full path to rootdir\n"
+@@ -97,7 +104,7 @@ repo_import_key_cb(struct xbps_repo *repo, void *arg UNUSED, bool *done UNUSED)
+ int
+ main(int argc, char **argv)
+ {
+-	const char *shortopts = "AC:c:DdfhIiMnR:r:SuUVvy";
++	const char *shortopts = "AC:c:DdfhIiMnoOR:r:SuUVvy";
+ 	const struct option longopts[] = {
+ 		{ "automatic", no_argument, NULL, 'A' },
+ 		{ "config", required_argument, NULL, 'C' },
+@@ -110,6 +117,8 @@ main(int argc, char **argv)
+ 		{ "ignore-file-conflicts", no_argument, NULL, 'I' },
+ 		{ "memory-sync", no_argument, NULL, 'M' },
+ 		{ "dry-run", no_argument, NULL, 'n' },
++		{ "clean-cache", no_argument, NULL, 'O' },
++		{ "remove-orphans", no_argument, NULL, 'o' },
+ 		{ "repository", required_argument, NULL, 'R' },
+ 		{ "rootdir", required_argument, NULL, 'r' },
+ 		{ "sync", no_argument, NULL, 'S' },
+@@ -125,13 +134,13 @@ main(int argc, char **argv)
+ 	struct xbps_handle xh;
+ 	struct xferstat xfer;
+ 	const char *rootdir, *cachedir, *confdir;
+-	int i, c, flags, rv, fflag = 0;
+-	bool syncf, yes, force, drun, update;
++	int i, c, flags, rv, fflag = 0, clean_cache = 0;
++	bool syncf, yes, force, drun, update, orphans;
+ 	int maxcols, eexist = 0;
+ 
+ 	rootdir = cachedir = confdir = NULL;
+ 	flags = rv = 0;
+-	syncf = yes = force = drun = update = false;
++	syncf = yes = force = drun = update = orphans = false;
+ 
+ 	memset(&xh, 0, sizeof(xh));
+ 
+@@ -179,6 +188,12 @@ main(int argc, char **argv)
+ 		case 'n':
+ 			drun = true;
+ 			break;
++		case 'O':
++			clean_cache++;
++			break;
++		case 'o':
++			orphans = true;
++			break;
+ 		case 'R':
+ 			xbps_repo_store(&xh, optarg);
+ 			break;
+@@ -209,7 +224,7 @@ main(int argc, char **argv)
+ 			/* NOTREACHED */
+ 		}
+ 	}
+-	if ((!update && !syncf) && (argc == optind))
++	if ((!update && !syncf && !clean_cache && !orphans) && (argc == optind))
+ 		usage(true);
+ 
+ 	/*
+@@ -249,7 +264,7 @@ main(int argc, char **argv)
+ 		}
+ 	}
+ 
+-	if (syncf && !update && (argc == optind))
++	if (syncf && !update && !clean_cache && !orphans && (argc == optind))
+ 		exit(EXIT_SUCCESS);
+ 
+ 	if (!(xh.flags & XBPS_FLAG_DOWNLOAD_ONLY) && !drun) {
+@@ -259,11 +274,39 @@ main(int argc, char **argv)
+ 		}
+ 	}
+ 
++	if (clean_cache > 0) {
++		rv = clean_cachedir(&xh, clean_cache, drun);
++		if (rv != 0) {
++			xbps_end(&xh);
++			exit(EXIT_FAILURE);
++		}
++		if (!orphans && !update && (argc == optind))
++			exit(EXIT_SUCCESS);
++	}
++
++	if (orphans) {
++		if ((rv = xbps_transaction_autoremove_pkgs(&xh)) != 0 && rv != ENOENT) {
++			xbps_error_printf("Failed to queue package "
++			    "orphans: %s\n", strerror(rv));
++			xbps_end(&xh);
++			exit(EXIT_FAILURE);
++		}
++		if (rv == 0) {
++			rv = exec_transaction(&xh, maxcols, yes, drun);
++		} else {
++			rv = 0; /* ENOENT: no orphans found, nothing to do */
++		}
++		if (!update && (argc == optind)) {
++			xbps_end(&xh);
++			exit(rv);
++		}
++	}
++
+ 	eexist = optind;
+ 
+ 	if (update && (argc == optind)) {
+ 		/* Update all installed packages */
+-		rv = dist_upgrade(&xh, maxcols, yes, drun);
++		rv = dist_upgrade(&xh, maxcols, yes, drun, argc, argv);
+ 	} else if (update) {
+ 		/* Update target packages */
+ 		for (i = optind; i < argc; i++) {
+diff --git a/bin/xbps-install/state_cb.c b/bin/xbps-install/state_cb.c
+index 350c608..63fc574 100644
+--- a/bin/xbps-install/state_cb.c
++++ b/bin/xbps-install/state_cb.c
+@@ -62,6 +62,12 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+ 	case XBPS_STATE_TRANS_CONFIGURE:
+ 		printf("\n[*] Configuring unpacked packages\n");
+ 		break;
++	case XBPS_STATE_TRANS_HOOKS:
++		if (xscd->desc[0] == '(')
++			printf("%s\n", xscd->desc);
++		else
++			printf("\n[*] %s\n", xscd->desc);
++		break;
+ 	case XBPS_STATE_PKGDB:
+ 		printf("[*] pkgdb upgrade in progress, please wait...\n");
+ 		break;
+@@ -161,6 +167,7 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+ 		break;
+ 	/* errors */
+ 	case XBPS_STATE_TRANS_FAIL:
++	case XBPS_STATE_TRANS_HOOKS_FAIL:
+ 	case XBPS_STATE_UNPACK_FAIL:
+ 	case XBPS_STATE_UPDATE_FAIL:
+ 	case XBPS_STATE_CONFIGURE_FAIL:
+diff --git a/bin/xbps-install/transaction.c b/bin/xbps-install/transaction.c
+index e27d46e..d24041a 100644
+--- a/bin/xbps-install/transaction.c
++++ b/bin/xbps-install/transaction.c
+@@ -310,8 +310,146 @@ all_pkgs_on_hold(struct transaction *trans)
+ 	return all_on_hold;
+ }
+ 
++/*
++ * Called when a full sysupgrade (-Su/-Syu, or -u with no target
++ * package given) finds that xbps itself -- or whatever package
++ * actually provides it, e.g. a distro's own replacement/fork -- needs
++ * updating before anything else in the transaction can proceed.
++ *
++ * Updates just that one package, then re-execs this same
++ * xbps-install invocation from scratch (same argv) so the freshly
++ * updated binary/library picks up and continues with the rest of the
++ * sysupgrade on its own. This automates the two-phase "update xbps
++ * first, then re-run the same command" workflow a person otherwise
++ * has to do by hand.
++ *
++ * Only one confirmation prompt covers the whole thing: if the person
++ * didn't already pass -y, they're asked once, up front, and -y is
++ * then added to the re-exec'd argv so the continuation after restart
++ * never prompts a second time.
++ */
++static int
++self_update_and_restart(struct xbps_handle *xhp, int argc, char **argv, bool yes)
++{
++	static char yflag[] = "-y";
++	char selfpath[PATH_MAX];
++	char **newargv;
++	ssize_t n;
++	int i, newargc, rv;
++	bool need_y = true;
++
++	if (!yes) {
++		if (!yesno("The package manager needs to update itself before "
++		    "continuing; the rest of this upgrade will then resume "
++		    "automatically, with no further prompts. Continue?")) {
++			return 0;
++		}
++	}
++
++	printf("[*] Updating the package manager first...\n");
++
++	/*
++	 * xbps_transaction_update_packages() above already left xhp->transd
++	 * populated: xbps_autoupdate() -- called from inside it purely to
++	 * *check* whether xbps needs updating -- calls trans_find_pkg()
++	 * itself as a side effect of that check, queuing xbps into the
++	 * transaction even though the caller went on to report EBUSY and
++	 * never actually committed anything. Every transaction-building
++	 * entry point (this one included) assumes it's the first and only
++	 * one to touch xhp->transd in this process, starting from a clean
++	 * slate. Building a second, unrelated transaction on top of that
++	 * already-dirtied one silently produces an inconsistent result
++	 * (previously verified in testing: the update reports success but
++	 * never actually lands on disk, so the process loops forever
++	 * re-detecting EBUSY after each restart). Release it and start
++	 * over clean.
++	 */
++	if (xhp->transd != NULL) {
++		xbps_object_release(xhp->transd);
++		xhp->transd = NULL;
++	}
++
++	rv = xbps_transaction_update_pkg(xhp, "xbps", false);
++	if (rv != 0 && rv != EEXIST) {
++		xbps_error_printf("Failed to queue the package manager update: %s\n",
++		    strerror(rv));
++		return rv;
++	}
++	if (rv == 0) {
++		rv = exec_transaction(xhp, 80, true, false);
++		if (rv != 0) {
++			xbps_error_printf("Failed to update the package manager, aborting.\n");
++			return rv;
++		}
++	}
++
++	/*
++	 * Resolve our own executable's real, current path so the re-exec
++	 * below is guaranteed to load the copy we just updated, rather
++	 * than whatever a PATH lookup on argv[0] might turn up.
++	 */
++	n = readlink("/proc/self/exe", selfpath, sizeof(selfpath) - 1);
++	if (n <= 0) {
++		/* Not on Linux, or /proc unavailable: fall back to argv[0]. */
++		xbps_strlcpy(selfpath, argv[0], sizeof(selfpath));
++	} else {
++		static const char deleted_suffix[] = " (deleted)";
++		size_t suffix_len = sizeof(deleted_suffix) - 1;
++		size_t path_len;
++
++		selfpath[n] = '\0';
++		/*
++		 * We just replaced our own executable file on disk (unlink
++		 * + create a new one at the same path is exactly what a
++		 * package update does, not an in-place edit): the kernel
++		 * appends " (deleted)" to the /proc/self/exe target once
++		 * the *original* inode this process is still running from
++		 * is gone, even though a brand new file now exists at that
++		 * very same path. The path up to that marker is still the
++		 * correct, real location -- strip the marker so we exec
++		 * the file that's actually there now, instead of trying
++		 * (and failing) to exec the literal string with " (deleted)"
++		 * appended.
++		 */
++		path_len = (size_t)n;
++		if (path_len > suffix_len &&
++		    strcmp(selfpath + path_len - suffix_len, deleted_suffix) == 0) {
++			selfpath[path_len - suffix_len] = '\0';
++		}
++	}
++
++	for (i = 0; i < argc; i++) {
++		if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) {
++			need_y = false;
++			break;
++		}
++	}
++
++	newargv = calloc((size_t)argc + 2, sizeof(char *));
++	if (newargv == NULL) {
++		xbps_error_printf("Out of memory; please re-run the command manually.\n");
++		return ENOMEM;
++	}
++	for (i = 0; i < argc; i++)
++		newargv[i] = argv[i];
++	newargc = argc;
++	if (need_y)
++		newargv[newargc++] = yflag;
++	newargv[newargc] = NULL;
++
++	printf("[*] Package manager updated, resuming the rest of the upgrade...\n");
++	fflush(stdout);
++
++	execv(selfpath, newargv);
++	/* execv() only returns on failure. */
++	xbps_error_printf("Failed to restart %s: %s\n", selfpath, strerror(errno));
++	free(newargv);
++	return errno;
++}
++
+ int
+-dist_upgrade(struct xbps_handle *xhp, unsigned int cols, bool yes, bool drun)
++dist_upgrade(struct xbps_handle *xhp, unsigned int cols, bool yes, bool drun,
++    int argc, char **argv)
+ {
+ 	int rv = 0;
+ 
+@@ -321,9 +459,10 @@ dist_upgrade(struct xbps_handle *xhp, unsigned int cols, bool yes, bool drun)
+ 		return 0;
+ 	} else if (rv == EBUSY) {
+ 		if (!drun) {
+-			xbps_error_printf("The 'xbps' package must be updated, please run `xbps-install -u xbps`\n");
+-			return rv;
++			return self_update_and_restart(xhp, argc, argv, yes);
+ 		}
++		/* dry-run: fall through to exec_transaction() below, same
++		 * as upstream's existing behavior for this case. */
+ 	} else if (rv == EEXIST) {
+ 		return 0;
+ 	} else if (rv == ENOTSUP) {
+diff --git a/bin/xbps-remove/clean-cache.c b/bin/xbps-remove/clean-cache.c
+index 38816b1..a06760a 100644
+--- a/bin/xbps-remove/clean-cache.c
++++ b/bin/xbps-remove/clean-cache.c
+@@ -66,7 +66,7 @@ binpkg_parse(char *buf, size_t bufsz, const char *path, const char **pkgver, con
+ 
+ struct cleaner_data {
+ 	bool dry;
+-	bool uninstalled;
++	int level;
+ };
+ 
+ static int
+@@ -94,11 +94,20 @@ cleaner_cb(struct xbps_handle *xhp, xbps_object_t obj,
+ 		return 0;
+ 	}
+ 
++	/*
++	 * Level 3+ ("-O -O -O"): unconditional full wipe, matching
++	 * pacman's `-Scc` -- don't even look the package up, just
++	 * remove it, regardless of whether it's the currently
++	 * installed version or matches a repository entry.
++	 */
++	if (data->level >= 3)
++		goto remove;
++
+ 	/*
+ 	 * Remove binary pkg if it's not registered in any repository
+ 	 * or if hash doesn't match.
+ 	 */
+-	if (data->uninstalled) {
++	if (data->level >= 2) {
+ 		pkgd = xbps_pkgdb_get_pkg(xhp, binpkgver);
+ 	} else {
+ 		pkgd = xbps_rpool_get_pkg(xhp, binpkgver);
+@@ -118,13 +127,15 @@ cleaner_cb(struct xbps_handle *xhp, xbps_object_t obj,
+ 			return 0;
+ 		}
+ 	}
++remove:
+ 	snprintf(buf, sizeof(buf), "%s.sig", binpkg);
+ 	snprintf(buf2, sizeof(buf2), "%s.sig2", binpkg);
+ 	if (!data->dry && unlink(binpkg) == -1) {
+ 		xbps_error_printf("Failed to remove `%s': %s\n",
+ 		    binpkg, strerror(errno));
+ 	} else {
+-		printf("Removed %s from cachedir (obsolete)\n", binpkg);
++		printf("Removed %s from cachedir%s\n", binpkg,
++		    data->level >= 3 ? "" : " (obsolete)");
+ 	}
+ 	if (!data->dry && unlink(buf) == -1 && errno != ENOENT) {
+ 		xbps_error_printf("Failed to remove `%s': %s\n",
+@@ -139,7 +150,7 @@ cleaner_cb(struct xbps_handle *xhp, xbps_object_t obj,
+ }
+ 
+ int
+-clean_cachedir(struct xbps_handle *xhp, bool uninstalled, bool drun)
++clean_cachedir(struct xbps_handle *xhp, int level, bool drun)
+ {
+ 	xbps_array_t array = NULL;
+ 	DIR *dirp;
+@@ -151,9 +162,12 @@ clean_cachedir(struct xbps_handle *xhp, bool uninstalled, bool drun)
+ 	// its done potentially concurrently by threads through the
+ 	// xbps_array_foreach_cb_multi call later.
+ 	// XXX: same for the repository pool...
+-	if (uninstalled) {
++	//
++	// Level 3+ is an unconditional wipe: it never looks anything up
++	// in pkgdb or the repo pool, so there's nothing to preload.
++	if (level == 2) {
+ 		(void)xbps_pkgdb_get_pkg(xhp, "package-that-wont-exist");
+-	} else {
++	} else if (level == 1) {
+ 		(void)xbps_rpool_get_pkg(xhp, "package-that-wont-exist-so-it-loads-all-repos");
+ 		(void)xbps_pkgdb_get_pkg(xhp, "package-that-wont-exist");
+ 	}
+@@ -204,7 +218,7 @@ clean_cachedir(struct xbps_handle *xhp, bool uninstalled, bool drun)
+ 	if (xbps_array_count(array)) {
+ 		struct cleaner_data data = {
+ 			.dry = drun,
+-			.uninstalled = uninstalled,
++			.level = level,
+ 		};
+ 		r = xbps_array_foreach_cb_multi(xhp, array, NULL, cleaner_cb, (void*)&data);
+ 	} else {
+diff --git a/bin/xbps-remove/defs.h b/bin/xbps-remove/defs.h
+index 5b39ba8..106c55e 100644
+--- a/bin/xbps-remove/defs.h
++++ b/bin/xbps-remove/defs.h
+@@ -27,6 +27,6 @@
+ #define _XBPS_REMOVE_DEFS_H_
+ 
+ /* From clean-cache.c */
+-int	clean_cachedir(struct xbps_handle *, bool uninstalled, bool drun);
++int	clean_cachedir(struct xbps_handle *, int level, bool drun);
+ 
+ #endif /* !_XBPS_REMOVE_DEFS_H_ */
+diff --git a/bin/xbps-remove/main.c b/bin/xbps-remove/main.c
+index 1ab4ffc..42d2f54 100644
+--- a/bin/xbps-remove/main.c
++++ b/bin/xbps-remove/main.c
+@@ -54,6 +54,7 @@ usage(bool fail)
+ 	    " -n, --dry-run             Dry-run mode\n"
+ 	    " -O, --clean-cache         Remove outdated packages from the cache\n"
+ 	    "                           If specified twice, also remove uninstalled packages\n"
++	    "                           If specified three times, remove everything from the cache\n"
+ 	    " -o, --remove-orphans      Remove package orphans\n"
+ 	    " -R, --recursive           Recursively remove dependencies\n"
+ 	    " -r, --rootdir <dir>       Full path to rootdir\n"
+@@ -78,6 +79,12 @@ state_cb_rm(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+ 	case XBPS_STATE_REMOVE:
+ 		printf("Removing `%s' ...\n", xscd->arg);
+ 		break;
++	case XBPS_STATE_TRANS_HOOKS:
++		if (xscd->desc[0] == '(')
++			printf("%s\n", xscd->desc);
++		else
++			printf("\n[*] %s\n", xscd->desc);
++		break;
+ 	/* success */
+ 	case XBPS_STATE_REMOVE_FILE:
+ 	case XBPS_STATE_REMOVE_FILE_OBSOLETE:
+@@ -94,6 +101,7 @@ state_cb_rm(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+ 		break;
+ 	/* errors */
+ 	case XBPS_STATE_REMOVE_FAIL:
++	case XBPS_STATE_TRANS_HOOKS_FAIL:
+ 		xbps_error_printf("%s\n", xscd->desc);
+ 		if (slog) {
+ 			syslog(LOG_ERR, "%s", xscd->desc);
+@@ -266,7 +274,7 @@ main(int argc, char **argv)
+ 	maxcols = get_maxcols();
+ 
+ 	if (clean_cache > 0) {
+-		rv = clean_cachedir(&xh, clean_cache > 1, drun);
++		rv = clean_cachedir(&xh, clean_cache, drun);
+ 		if (rv) {
+ 			xbps_end(&xh);
+ 			exit(EXIT_FAILURE);
+diff --git a/include/xbps.h.in b/include/xbps.h.in
+index 6a35eeb..f285c7b 100644
+--- a/include/xbps.h.in
++++ b/include/xbps.h.in
+@@ -299,6 +299,8 @@ extern "C" {
+  * - XBPS_STATE_TRANS_VERIFY: transaction is verifying binary package integrity.
+  * - XBPS_STATE_TRANS_RUN: transaction is performing operations: install, update, remove, replace.
+  * - XBPS_STATE_TRANS_CONFIGURE: transaction is configuring all unpacked packages.
++ * - XBPS_STATE_TRANS_HOOKS: transaction is running a user-defined pre/post hook.
++ * - XBPS_STATE_TRANS_HOOKS_FAIL: a user-defined transaction hook has failed.
+  * - XBPS_STATE_TRANS_FAIL: transaction has failed.
+  * - XBPS_STATE_DOWNLOAD: a binary package is being downloaded.
+  * - XBPS_STATE_VERIFY: a binary package is being verified.
+@@ -388,7 +390,9 @@ typedef enum xbps_state {
+ 	XBPS_STATE_ALTGROUP_REMOVED,
+ 	XBPS_STATE_ALTGROUP_SWITCHED,
+ 	XBPS_STATE_ALTGROUP_LINK_ADDED,
+-	XBPS_STATE_ALTGROUP_LINK_REMOVED
++	XBPS_STATE_ALTGROUP_LINK_REMOVED,
++	XBPS_STATE_TRANS_HOOKS,
++	XBPS_STATE_TRANS_HOOKS_FAIL
+ } xbps_state_t;
+ 
+ /**
+diff --git a/include/xbps_api_impl.h b/include/xbps_api_impl.h
+index 11aba15..85f3bb4 100644
+--- a/include/xbps_api_impl.h
++++ b/include/xbps_api_impl.h
+@@ -98,6 +98,7 @@ int HIDDEN xbps_transaction_fetch(struct xbps_handle *,
+ 		xbps_object_iterator_t);
+ int HIDDEN xbps_transaction_pkg_deps(struct xbps_handle *, xbps_array_t, xbps_dictionary_t);
+ int HIDDEN xbps_transaction_internalize(struct xbps_handle *, xbps_object_iterator_t);
++int HIDDEN xbps_transaction_hooks(struct xbps_handle *, const char *stage);
+ 
+ char HIDDEN *xbps_get_remote_repo_string(const char *);
+ int HIDDEN xbps_repo_sync(struct xbps_handle *, const char *);
+diff --git a/lib/Makefile b/lib/Makefile
+index 2b4efe4..41f85fa 100644
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@ -38,7 +38,7 @@ EXTOBJS = external/dewey.o external/fexec.o external/mkpath.o
+ OBJS = package_configure.o package_config_files.o package_orphans.o
+ OBJS += package_remove.o package_state.o
+ OBJS += package_unpack.o package_register.o package_script.o verifysig.o
+-OBJS += transaction_commit.o transaction_prepare.o
++OBJS += transaction_commit.o transaction_prepare.o transaction_hooks.o
+ OBJS += transaction_ops.o transaction_store.o transaction_check_replaces.o
+ OBJS += transaction_check_revdeps.o transaction_check_conflicts.o
+ OBJS += transaction_check_shlibs.o
+diff --git a/lib/transaction_commit.c b/lib/transaction_commit.c
+index 122b9f8..5330d23 100644
+--- a/lib/transaction_commit.c
++++ b/lib/transaction_commit.c
+@@ -108,6 +108,7 @@ xbps_transaction_commit(struct xbps_handle *xhp)
+ 	xbps_trans_type_t ttype;
+ 	const char *pkgver = NULL, *pkgname = NULL;
+ 	int rv = 0;
++	bool pkgdb_unlocked = false;
+ 
+ 	setlocale(LC_ALL, "");
+ 
+@@ -208,6 +209,16 @@ xbps_transaction_commit(struct xbps_handle *xhp)
+ 		goto out;
+ 	}
+ 
++	/*
++	 * Run user-defined pre-transaction hooks. A failing pre hook
++	 * aborts the transaction before anything is unpacked/removed.
++	 * Must run after chdir(rootdir) above: xbps_transaction_hooks()
++	 * relies on cwd == rootdir to build a chroot-safe relative exec
++	 * path (same trick xbps_pkg_exec_buffer() uses for pkg scripts).
++	 */
++	if ((rv = xbps_transaction_hooks(xhp, "pre")) != 0)
++		goto out;
++
+ 	/*
+ 	 * Run all pre-remove scripts.
+ 	 * And store the remove scripts in remove_scripts
+@@ -394,6 +405,22 @@ xbps_transaction_commit(struct xbps_handle *xhp)
+ 	if ((rv = xbps_pkgdb_update(xhp, true, true)) != 0)
+ 		goto out;
+ 
++	/*
++	 * pkgdb is now flushed to disk. Release the lock here, before
++	 * running any package INSTALL/REMOVE scripts or post-transaction
++	 * hooks: both can legitimately want to shell out to
++	 * xbps-install/xbps-remove themselves (e.g. a hook that clears
++	 * the package cache, or a package script that installs another
++	 * package it needs at runtime), and without releasing the lock
++	 * first, that nested call would deadlock forever waiting on the
++	 * lock this same process is still holding.
++	 *
++	 * The lock is re-acquired further down, right before the final
++	 * pkgdb_update() call, so that write stays protected too.
++	 */
++	xbps_pkgdb_unlock(xhp);
++	pkgdb_unlocked = true;
++
+ 	/*
+ 	 * Run all post and purge-remove scripts.
+ 	 */
+@@ -439,10 +466,95 @@ xbps_transaction_commit(struct xbps_handle *xhp)
+ 		}
+ 	}
+ 
++	/*
++	 * Run user-defined post-transaction hooks. Failures here are
++	 * reported but do not change the transaction's own result: the
++	 * install/update/remove already completed successfully by this
++	 * point, and there is nothing left to roll back.
++	 *
++	 * The pkgdb lock was already released above (see the comment
++	 * next to xbps_pkgdb_unlock() near the first xbps_pkgdb_update()
++	 * call), specifically so hooks are free to shell out to
++	 * xbps-install/xbps-remove without deadlocking.
++	 *
++	 * Pre-transaction hooks deliberately do NOT get this treatment:
++	 * at that point nothing has been written yet, so releasing the
++	 * lock there would let a hook-spawned transaction race with (and
++	 * potentially corrupt) the one that's about to run.
++	 */
++	(void)xbps_transaction_hooks(xhp, "post");
++
+ out:
+ 	xbps_object_release(remove_scripts);
+ 	xbps_object_iterator_release(iter);
+ 	if (rv == 0) {
++		/*
++		 * Re-acquire the lock released above before this final
++		 * write: pkgdb was safe to read/write-free while post
++		 * and pre-purge scripts and post-transaction hooks ran,
++		 * but this last update needs the same protection the
++		 * first one had. Only do this if we actually unlocked
++		 * earlier in this call -- xbps_pkgdb_lock() is not
++		 * reentrant, and calling it again while this process
++		 * still holds the original lock (every early `goto out`
++		 * above the unlock point) would deadlock the process
++		 * against itself.
++		 */
++		if (pkgdb_unlocked) {
++			xbps_dictionary_t fresh, ours;
++			xbps_array_t pkgs;
++			unsigned int i;
++
++			if (xbps_pkgdb_lock(xhp) < 0)
++				return errno;
++			/*
++			 * While the lock was released, a package script
++			 * or a transaction hook may have spawned its own
++			 * xbps-install/xbps-remove and modified pkgdb on
++			 * disk (e.g. removed some other, unrelated
++			 * package). This process's in-memory xhp->pkgdb
++			 * still reflects the state from right after this
++			 * transaction's own packages were unpacked/
++			 * configured -- it has no idea about that
++			 * external change. Blindly flushing it now would
++			 * silently undo whatever the nested process did
++			 * (a hook removing package X would have X
++			 * resurrected in pkgdb metadata here, even though
++			 * X's files are already gone from disk).
++			 *
++			 * Re-read the current on-disk pkgdb and re-apply
++			 * only *this* transaction's own package state
++			 * changes on top of it, instead of overwriting
++			 * the whole thing with our now-partially-stale
++			 * copy.
++			 */
++			fresh = xbps_dictionary_internalize_from_file(xhp->pkgdb_plist);
++			if (fresh == NULL)
++				fresh = xbps_dictionary_create();
++
++			ours = xhp->pkgdb;
++			pkgs = xbps_dictionary_get(xhp->transd, "packages");
++			for (i = 0; i < xbps_array_count(pkgs); i++) {
++				xbps_dictionary_t pkgd = xbps_array_get(pkgs, i);
++				xbps_trans_type_t pttype = xbps_transaction_pkg_type(pkgd);
++				const char *tpkgname = NULL;
++
++				xbps_dictionary_get_cstring_nocopy(pkgd, "pkgname", &tpkgname);
++				if (tpkgname == NULL)
++					continue;
++
++				if (pttype == XBPS_TRANS_REMOVE) {
++					xbps_dictionary_remove(fresh, tpkgname);
++				} else {
++					xbps_dictionary_t updated =
++					    xbps_dictionary_get(ours, tpkgname);
++					if (updated != NULL)
++						xbps_dictionary_set(fresh, tpkgname, updated);
++				}
++			}
++			xbps_object_release(ours);
++			xhp->pkgdb = fresh;
++		}
+ 		/* Force a pkgdb write for all unpacked pkgs in transaction */
+ 		rv = xbps_pkgdb_update(xhp, true, true);
+ 	}
+diff --git a/lib/transaction_hooks.c b/lib/transaction_hooks.c
+new file mode 100644
+index 0000000..818d3fc
+--- /dev/null
++++ b/lib/transaction_hooks.c
+@@ -0,0 +1,677 @@
++/*-
++ * Copyright (c) 2026 Voidbr contributors.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
++ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
++ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
++ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
++ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
++ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <sys/wait.h>
++
++#include <ctype.h>
++#include <dirent.h>
++#include <errno.h>
++#include <fnmatch.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "xbps_api_impl.h"
++
++/**
++ * @file lib/transaction_hooks.c
++ * @brief User-defined transaction hooks (pacman ALPM-hooks-style)
++ *
++ * Hook files live in <confdir>/hooks.d/ as *.hook and use the same
++ * two-section syntax as pacman's alpm-hooks(5):
++ *
++ *   [Trigger]
++ *   Operation = Install
++ *   Operation = Upgrade
++ *   Type = Package
++ *   Target = linux*
++ *
++ *   [Action]
++ *   Description = Rebuilding initramfs...
++ *   When = PostTransaction
++ *   Exec = /usr/bin/dracut --regenerate-all --force
++ *   NeedsTargets
++ *
++ * Supported keys:
++ *   Trigger.Operation  Install | Upgrade | Remove (repeatable)
++ *   Trigger.Type       Package | Path
++ *   Trigger.Target     glob pattern (repeatable); for Type=Package
++ *                      matched against pkgname, for Type=Path matched
++ *                      against installed file paths (see caveat below)
++ *   Action.Description free text, only used for the state callback
++ *   Action.When        PreTransaction | PostTransaction
++ *   Action.Exec        command line (split on whitespace; no shell,
++ *                      no quoting support -- keep it a single binary
++ *                      + plain args, or point it at a wrapper script)
++ *   Action.NeedsTargets bare flag (no value): matched target names
++ *                      are written to the command's stdin, one per
++ *                      line, same as alpm-hooks(5)
++ *
++ * KNOWN LIMITATIONS (documented, not silently papered over):
++ *
++ *  - Exec parsing is a naive whitespace split, unlike pacman's real
++ *    wordsplit (no quoting/escaping support).
++ *  - Type=Path matching uses xbps_pkgdb_get_pkg_files(), i.e. the
++ *    *currently installed* file list for that pkgname. For
++ *    Operation=Remove that list is still correct at PreTransaction
++ *    time (files not removed yet) but is gone by PostTransaction
++ *    (package already removed from pkgdb) -- Path+Remove+Post is a
++ *    known gap and is skipped with a debug message rather than
++ *    silently matching wrong. For Operation=Install/Upgrade,
++ *    PostTransaction works correctly because pkgdb is updated before
++ *    post hooks run; PreTransaction can't see not-yet-installed
++ *    files at all (also skipped).
++ *  - No Depends key, no NeedsTargets file-path granularity beyond
++ *    what's described above.
++ */
++
++#define XBPS_HOOKS_RELDIR "hooks.d"
++#define XBPS_HOOK_EXT ".hook"
++
++struct strv {
++	char **items;
++	size_t count;
++};
++
++struct xbps_hook {
++	/* [Trigger] */
++	struct strv operations;	/* lowercased: "install"/"upgrade"/"remove" */
++	char *type;		/* "package" or "path", lowercased */
++	struct strv targets;
++	/* [Action] */
++	char *description;
++	char *when;		/* "pre" or "post" */
++	char *exec;
++	bool needs_targets;
++};
++
++static void
++strv_free(struct strv *v)
++{
++	for (size_t i = 0; i < v->count; i++)
++		free(v->items[i]);
++	free(v->items);
++	v->items = NULL;
++	v->count = 0;
++}
++
++static int
++strv_add(struct strv *v, const char *s)
++{
++	char **n = realloc(v->items, (v->count + 1) * sizeof(char *));
++	if (n == NULL)
++		return ENOMEM;
++	v->items = n;
++	v->items[v->count] = strdup(s);
++	if (v->items[v->count] == NULL)
++		return ENOMEM;
++	v->count++;
++	return 0;
++}
++
++static void
++hook_free(struct xbps_hook *h)
++{
++	if (h == NULL)
++		return;
++	strv_free(&h->operations);
++	strv_free(&h->targets);
++	free(h->type);
++	free(h->description);
++	free(h->when);
++	free(h->exec);
++	free(h);
++}
++
++static char *
++trim(char *s)
++{
++	char *end;
++
++	while (*s == ' ' || *s == '\t')
++		s++;
++	if (*s == '\0')
++		return s;
++	end = s + strlen(s) - 1;
++	while (end > s && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) {
++		*end = '\0';
++		end--;
++	}
++	return s;
++}
++
++static char *
++strlower(char *s)
++{
++	for (char *p = s; *p; p++)
++		*p = (char)tolower((unsigned char)*p);
++	return s;
++}
++
++/*
++ * Minimal .hook (INI-like) parser: two sections, "key = value" or
++ * bare "key" (flag, e.g. NeedsTargets) lines, '#' or ';' at the
++ * start of a (trimmed) line is a comment, repeated keys accumulate
++ * (Operation, Target).
++ */
++static struct xbps_hook *
++parse_hook_file(const char *path)
++{
++	FILE *fp;
++	char line[1024];
++	char section = 0; /* 0=none, 't'=Trigger, 'a'=Action */
++	struct xbps_hook *h;
++
++	fp = fopen(path, "r");
++	if (fp == NULL)
++		return NULL;
++
++	h = calloc(1, sizeof(*h));
++	if (h == NULL) {
++		fclose(fp);
++		return NULL;
++	}
++
++	while (fgets(line, sizeof(line), fp) != NULL) {
++		char *l = trim(line);
++		char *key, *val, *eq;
++
++		if (*l == '\0' || *l == '#' || *l == ';')
++			continue;
++
++		if (*l == '[') {
++			if (strcasecmp(l, "[Trigger]") == 0)
++				section = 't';
++			else if (strcasecmp(l, "[Action]") == 0)
++				section = 'a';
++			else
++				section = 0;
++			continue;
++		}
++
++		eq = strchr(l, '=');
++		if (eq != NULL) {
++			*eq = '\0';
++			key = trim(l);
++			val = trim(eq + 1);
++		} else {
++			key = l;
++			val = NULL;
++		}
++
++		if (section == 't') {
++			if (strcasecmp(key, "Operation") == 0 && val) {
++				strv_add(&h->operations, strlower(val));
++			} else if (strcasecmp(key, "Type") == 0 && val) {
++				free(h->type);
++				h->type = strdup(strlower(val));
++			} else if (strcasecmp(key, "Target") == 0 && val) {
++				strv_add(&h->targets, val);
++			}
++		} else if (section == 'a') {
++			if (strcasecmp(key, "Description") == 0 && val) {
++				free(h->description);
++				h->description = strdup(val);
++			} else if (strcasecmp(key, "When") == 0 && val) {
++				free(h->when);
++				if (strcasecmp(val, "PreTransaction") == 0)
++					h->when = strdup("pre");
++				else if (strcasecmp(val, "PostTransaction") == 0)
++					h->when = strdup("post");
++				else
++					h->when = strdup(strlower(val));
++			} else if (strcasecmp(key, "Exec") == 0 && val) {
++				free(h->exec);
++				h->exec = strdup(val);
++			} else if (strcasecmp(key, "NeedsTargets") == 0) {
++				h->needs_targets = true;
++			}
++		}
++	}
++	fclose(fp);
++
++	if (h->type == NULL || h->when == NULL || h->exec == NULL) {
++		xbps_dbg_printf("[hooks] %s: missing required Type/When/Exec, ignoring\n", path);
++		hook_free(h);
++		return NULL;
++	}
++	return h;
++}
++
++static const char *
++op_name(xbps_trans_type_t ttype)
++{
++	switch (ttype) {
++	case XBPS_TRANS_INSTALL:
++	case XBPS_TRANS_REINSTALL:
++		return "install";
++	case XBPS_TRANS_UPDATE:
++		return "upgrade";
++	case XBPS_TRANS_REMOVE:
++		return "remove";
++	default:
++		return NULL;
++	}
++}
++
++static bool
++op_matches(struct xbps_hook *h, xbps_trans_type_t ttype)
++{
++	const char *name = op_name(ttype);
++
++	if (name == NULL)
++		return false;
++	if (h->operations.count == 0)
++		return true;
++	for (size_t i = 0; i < h->operations.count; i++)
++		if (strcmp(h->operations.items[i], name) == 0)
++			return true;
++	return false;
++}
++
++static bool
++target_matches_any(struct strv *targets, const char *value)
++{
++	if (targets->count == 0)
++		return true; /* no Target: matches everything (rare, but valid) */
++	for (size_t i = 0; i < targets->count; i++)
++		if (fnmatch(targets->items[i], value, 0) == 0)
++			return true;
++	return false;
++}
++
++/*
++ * Collects, into `matched`, the set of target strings (pkgnames for
++ * Type=Package, file paths for Type=Path) in the current transaction
++ * that this hook's [Trigger] section matches. Returns true if at
++ * least one match was found (i.e. the hook should run).
++ */
++static bool
++collect_matches(struct xbps_handle *xhp, struct xbps_hook *h, struct strv *matched)
++{
++	xbps_array_t pkgs;
++	bool any = false;
++
++	pkgs = xbps_dictionary_get(xhp->transd, "packages");
++	if (pkgs == NULL)
++		return false;
++
++	for (unsigned int i = 0; i < xbps_array_count(pkgs); i++) {
++		xbps_dictionary_t pkgd = xbps_array_get(pkgs, i);
++		xbps_trans_type_t ttype = xbps_transaction_pkg_type(pkgd);
++		const char *pkgname = NULL;
++
++		if (ttype == XBPS_TRANS_HOLD || ttype == XBPS_TRANS_CONFIGURE)
++			continue;
++		if (!op_matches(h, ttype))
++			continue;
++
++		xbps_dictionary_get_cstring_nocopy(pkgd, "pkgname", &pkgname);
++		if (pkgname == NULL)
++			continue;
++
++		if (strcmp(h->type, "package") == 0) {
++			if (target_matches_any(&h->targets, pkgname)) {
++				strv_add(matched, pkgname);
++				any = true;
++			}
++		} else if (strcmp(h->type, "path") == 0) {
++			xbps_dictionary_t filesd;
++			xbps_array_t a;
++
++			/*
++			 * See the top-of-file caveat: this only works
++			 * for Install/Upgrade at PostTransaction, and
++			 * for Remove at PreTransaction (pkgdb still has
++			 * the file list in both those cases). Anything
++			 * else is skipped rather than guessed at.
++			 */
++			if (ttype == XBPS_TRANS_REMOVE && strcmp(h->when, "post") == 0) {
++				xbps_dbg_printf("[hooks] %s: skipping Type=Path match for "
++				    "removed pkg at PostTransaction (files already "
++				    "gone from pkgdb)\n", pkgname);
++				continue;
++			}
++			if (ttype != XBPS_TRANS_REMOVE && strcmp(h->when, "pre") == 0) {
++				xbps_dbg_printf("[hooks] %s: skipping Type=Path match for "
++				    "install/upgrade at PreTransaction (files not "
++				    "unpacked yet)\n", pkgname);
++				continue;
++			}
++
++			filesd = xbps_pkgdb_get_pkg_files(xhp, pkgname);
++			if (filesd == NULL)
++				continue;
++
++			a = xbps_dictionary_get(filesd, "files");
++			for (unsigned int j = 0; a && j < xbps_array_count(a); j++) {
++				xbps_dictionary_t fd = xbps_array_get(a, j);
++				const char *file = NULL;
++				xbps_dictionary_get_cstring_nocopy(fd, "file", &file);
++				if (file && target_matches_any(&h->targets, file)) {
++					strv_add(matched, pkgname);
++					any = true;
++					break;
++				}
++			}
++		}
++	}
++	return any;
++}
++
++/*
++ * See the fexec.c rationale reused from the earlier revision of this
++ * file: xbps_file_exec()'s underlying fork chroot()s into rootdir
++ * only under specific conditions, and in every case cwd (already
++ * chdir()'d to rootdir by the caller, see transaction_commit.c)
++ * ends up mapping to the right place for a *relative*,
++ * non-rootdir-prefixed path. Hook Exec= lines are expected to be
++ * absolute host paths (like pacman hooks, e.g. "/usr/bin/mkinitcpio");
++ * we only strip the rootdir prefix here, we don't otherwise rewrite
++ * the command.
++ */
++static char *
++relative_to_rootdir(struct xbps_handle *xhp, const char *path)
++{
++	size_t rootlen;
++
++	if (strcmp(xhp->rootdir, "/") == 0)
++		return strdup(path);
++
++	rootlen = strlen(xhp->rootdir);
++	if (strncmp(path, xhp->rootdir, rootlen) != 0)
++		return strdup(path);
++
++	path += rootlen;
++	while (*path == '/')
++		path++;
++	return strdup(path);
++}
++
++/*
++ * Splits `cmd` on whitespace into a NULL-terminated argv. Naive: no
++ * quoting/escaping support (documented limitation, see file header).
++ */
++static char **
++split_exec(const char *cmd)
++{
++	char *copy, *tok, *save;
++	char **argv;
++	size_t n = 0, cap = 8;
++
++	copy = strdup(cmd);
++	if (copy == NULL)
++		return NULL;
++	argv = malloc(cap * sizeof(char *));
++	if (argv == NULL) {
++		free(copy);
++		return NULL;
++	}
++
++	for (tok = strtok_r(copy, " \t", &save); tok != NULL;
++	     tok = strtok_r(NULL, " \t", &save)) {
++		if (n + 1 >= cap) {
++			cap *= 2;
++			argv = realloc(argv, cap * sizeof(char *));
++			if (argv == NULL) {
++				free(copy);
++				return NULL;
++			}
++		}
++		argv[n++] = strdup(tok);
++	}
++	argv[n] = NULL;
++	free(copy);
++	return argv;
++}
++
++/*
++ * Forks, execs the hook's Exec= command (argv[0] rewritten to be
++ * chroot/rootdir-safe, see relative_to_rootdir()), and, if
++ * needs_targets, writes one matched target per line to its stdin.
++ * Mirrors pfcexec() in lib/external/fexec.c but adds stdin piping,
++ * which xbps_file_exec() does not support.
++ */
++static int
++exec_hook_action(struct xbps_handle *xhp, struct xbps_hook *h, struct strv *matched)
++{
++	char **argv;
++	char *execpath;
++	int pipefd[2] = { -1, -1 };
++	pid_t child;
++	int status, rv = 0;
++
++	argv = split_exec(h->exec);
++	if (argv == NULL || argv[0] == NULL) {
++		free(argv);
++		return EINVAL;
++	}
++
++	execpath = relative_to_rootdir(xhp, argv[0]);
++	if (execpath == NULL) {
++		for (char **p = argv; *p; p++)
++			free(*p);
++		free(argv);
++		return ENOMEM;
++	}
++	free(argv[0]);
++	argv[0] = execpath;
++
++	if (h->needs_targets) {
++		if (pipe(pipefd) == -1) {
++			rv = errno;
++			goto out;
++		}
++	}
++
++	child = fork();
++	if (child == -1) {
++		rv = errno;
++		goto out;
++	}
++
++	if (child == 0) {
++		if (h->needs_targets) {
++			dup2(pipefd[0], STDIN_FILENO);
++			close(pipefd[0]);
++			close(pipefd[1]);
++		}
++		if (strcmp(xhp->rootdir, "/") != 0) {
++			if ((geteuid() == 0) && (access("bin/sh", X_OK) == 0)) {
++				if (chroot(xhp->rootdir) == -1)
++					_exit(errno);
++				if (chdir("/") == -1)
++					_exit(errno);
++			}
++		}
++		umask(022);
++		execv(argv[0], argv);
++		_exit(errno);
++	}
++
++	if (h->needs_targets) {
++		FILE *wf;
++		close(pipefd[0]);
++		wf = fdopen(pipefd[1], "w");
++		if (wf != NULL) {
++			for (size_t i = 0; i < matched->count; i++)
++				fprintf(wf, "%s\n", matched->items[i]);
++			fclose(wf); /* also closes pipefd[1] */
++		} else {
++			close(pipefd[1]);
++		}
++	}
++
++	while (waitpid(child, &status, 0) < 0) {
++		if (errno != EINTR) {
++			rv = errno;
++			goto out;
++		}
++	}
++	if (!WIFEXITED(status))
++		rv = ECHILD;
++	else
++		rv = WEXITSTATUS(status);
++
++out:
++	for (char **p = argv; *p; p++)
++		free(*p);
++	free(argv);
++	return rv;
++}
++
++struct pending_hook {
++	char *path;
++	struct xbps_hook *h;
++	struct strv matched;
++};
++
++int HIDDEN
++xbps_transaction_hooks(struct xbps_handle *xhp, const char *stage)
++{
++	char *dir;
++	struct dirent **namelist = NULL;
++	int n, rv = 0;
++	struct pending_hook *pending = NULL;
++	size_t npending = 0, capending = 0;
++
++	assert(xhp);
++	assert(stage);
++
++	if (xhp->target_arch && strcmp(xhp->native_arch, xhp->target_arch)) {
++		/* cross/target-arch transactions don't run host hooks */
++		return 0;
++	}
++
++	dir = xbps_xasprintf("%s/%s", xhp->confdir, XBPS_HOOKS_RELDIR);
++	if (dir == NULL)
++		return ENOMEM;
++
++	n = scandir(dir, &namelist, NULL, alphasort);
++	if (n < 0) {
++		free(dir);
++		return (errno == ENOENT) ? 0 : errno;
++	}
++
++	/*
++	 * First pass: parse every *.hook file and figure out which ones
++	 * actually apply to this stage and this transaction, so we can
++	 * report "(i/total)" the same way pacman's hook runner does,
++	 * instead of numbering files that end up not matching anything.
++	 */
++	for (int i = 0; i < n; i++) {
++		const char *name = namelist[i]->d_name;
++		size_t len = strlen(name);
++		size_t extlen = strlen(XBPS_HOOK_EXT);
++		char *path;
++		struct xbps_hook *h;
++		struct strv matched = { 0 };
++
++		free(namelist[i]);
++		if (len <= extlen || strcmp(name + len - extlen, XBPS_HOOK_EXT) != 0)
++			continue;
++
++		path = xbps_xasprintf("%s/%s", dir, name);
++		if (path == NULL)
++			continue;
++
++		h = parse_hook_file(path);
++		if (h == NULL) {
++			free(path);
++			continue;
++		}
++		if (strcmp(h->when, stage) != 0 || !collect_matches(xhp, h, &matched)) {
++			strv_free(&matched);
++			hook_free(h);
++			free(path);
++			continue;
++		}
++
++		if (npending == capending) {
++			size_t newcap = capending ? capending * 2 : 4;
++			struct pending_hook *np = realloc(pending, newcap * sizeof(*np));
++			if (np == NULL) {
++				strv_free(&matched);
++				hook_free(h);
++				free(path);
++				continue;
++			}
++			pending = np;
++			capending = newcap;
++		}
++		pending[npending].path = path;
++		pending[npending].h = h;
++		pending[npending].matched = matched;
++		npending++;
++	}
++	free(namelist);
++	free(dir);
++
++	if (npending == 0) {
++		free(pending);
++		return 0;
++	}
++
++	xbps_set_cb_state(xhp, XBPS_STATE_TRANS_HOOKS, 0, stage,
++	    "Running %s-transaction hooks", stage);
++
++	/*
++	 * Second pass: actually run them, numbered (i/total) like
++	 * pacman's "(1/2) ..." hook progress output.
++	 */
++	for (size_t i = 0; i < npending; i++) {
++		struct pending_hook *p = &pending[i];
++		const char *desc = p->h->description ? p->h->description : p->path;
++		int hrv;
++
++		xbps_set_cb_state(xhp, XBPS_STATE_TRANS_HOOKS, 0, stage,
++		    "(%zu/%zu) %s", i + 1, npending, desc);
++
++		hrv = exec_hook_action(xhp, p->h, &p->matched);
++		if (hrv != 0) {
++			xbps_dbg_printf("[hooks] %s: exec failed (stage=%s): %s\n",
++			    p->path, stage, strerror(hrv));
++			/*
++			 * A failing PreTransaction hook aborts the
++			 * transaction, mirroring pacman semantics; a
++			 * failing PostTransaction hook is only logged.
++			 */
++			if (strcmp(stage, "pre") == 0 && rv == 0) {
++				rv = hrv;
++				xbps_set_cb_state(xhp, XBPS_STATE_TRANS_HOOKS_FAIL, rv, p->path,
++				    "[trans] hook failed: %s", p->path);
++			}
++		}
++		strv_free(&p->matched);
++		hook_free(p->h);
++		free(p->path);
++	}
++	free(pending);
++	return rv;
++}
+diff --git a/lib/transaction_ops.c b/lib/transaction_ops.c
+index 7dd3ffd..1ab33d0 100644
+--- a/lib/transaction_ops.c
++++ b/lib/transaction_ops.c
+@@ -51,6 +51,37 @@
+  * Text inside of white boxes are the key associated with the object, its
+  * data type is specified on its edge, i.e string, array, integer, dictionary.
+  */
++/*
++ * Returns true if any pattern in `arr` (a "conflicts" or "replaces"
++ * array) names pkgname. Used so a virtual package's installed
++ * provider that explicitly conflicts with/replaces the literal
++ * target name is never abandoned in favor of that literal package --
++ * see the comment where this is used, in trans_find_pkg().
++ */
++static bool
++array_names_pkg(xbps_array_t arr, const char *pkgname)
++{
++	unsigned int i;
++
++	if (arr == NULL || pkgname == NULL)
++		return false;
++
++	for (i = 0; i < xbps_array_count(arr); i++) {
++		const char *pattern = NULL;
++		char patname[XBPS_NAME_SIZE] = {0};
++
++		if (!xbps_array_get_cstring_nocopy(arr, i, &pattern))
++			continue;
++		if (!xbps_pkgpattern_name(patname, sizeof(patname), pattern) &&
++		    !xbps_pkg_name(patname, sizeof(patname), pattern)) {
++			xbps_strlcpy(patname, pattern, sizeof(patname));
++		}
++		if (strcmp(patname, pkgname) == 0)
++			return true;
++	}
++	return false;
++}
++
+ static int
+ trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
+ {
+@@ -85,9 +116,34 @@ trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
+ 	}
+ 
+ 	if (vpkg_pkgdb) {
+-		// virtual package installed, if there is no real package in
+-		// the rpool, we are keeping the virtual package.
+-		pkg_repod = xbps_rpool_get_pkg(xhp, pkg);
++		// virtual package installed. Only consider switching to a
++		// literally-named real package from the repo pool if the
++		// installed provider doesn't itself declare that it
++		// conflicts with or replaces that exact name -- e.g. a
++		// distro's own xbps fork that provides "xbps" but
++		// explicitly conflicts=/replaces= the real xbps package.
++		// Blindly switching to the real package in that case
++		// fails outright with unresolvable conflicts/shlibs
++		// (the fork already replaced what the real package
++		// depends on), or would silently downgrade/replace the
++		// fork the person actually has installed.
++		//
++		// The escape hatch is `-ff` (force specified *twice*,
++		// XBPS_FLAG_FORCE_UNPACK), not plain `-f`: a single -f is
++		// commonly typed out of habit alongside -Syu (e.g.
++		// `-Syuf`) for its ordinary meaning (force reinstall) and
++		// must never silently also override a deliberate
++		// conflicts=/replaces= relationship -- that already
++		// happened once and broke a fork's own package manager.
++		// Requiring the stronger, rarely-typed -ff for this
++		// specific override keeps the common case safe while
++		// still letting someone explicitly swap e.g. a minimal
++		// "-stub" package for the real thing when they mean to.
++		if ((xhp->flags & XBPS_FLAG_FORCE_UNPACK) ||
++		    (!array_names_pkg(xbps_dictionary_get(vpkg_pkgdb, "conflicts"), pkg) &&
++		     !array_names_pkg(xbps_dictionary_get(vpkg_pkgdb, "replaces"), pkg))) {
++			pkg_repod = xbps_rpool_get_pkg(xhp, pkg);
++		}
+ 		if (!pkg_repod) {
+ 			pkg_pkgdb = vpkg_pkgdb;
+ 			// if we are using the installed virtual package,
+@@ -239,9 +295,17 @@ trans_find_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
+ 
+ /*
+  * Returns 1 if there's an update, 0 if none or -1 on error.
++ * If pkgname_out is non-NULL, it's filled with the real pkgname that
++ * provides "xbps" (which may not literally be "xbps" -- e.g. a
++ * derivative distro's own fork/replacement package), resolved via
++ * xbps_pkgdb_get_virtualpkg() below. Callers that need to check
++ * "is the pkg the user asked to update the one that provides xbps"
++ * should compare against this, not against the literal string
++ * "xbps" -- a hardcoded strcmp(pkg, "xbps") silently breaks for any
++ * package that replaces/provides xbps under a different name.
+  */
+ static int
+-xbps_autoupdate(struct xbps_handle *xhp)
++xbps_autoupdate(struct xbps_handle *xhp, char *pkgname_out, size_t pkgname_out_len)
+ {
+ 	xbps_array_t rdeps;
+ 	xbps_dictionary_t pkgd;
+@@ -262,6 +326,8 @@ xbps_autoupdate(struct xbps_handle *xhp)
+ 	if (!xbps_dictionary_get_cstring_nocopy(pkgd, "pkgname", &pkgname)) {
+ 		return EINVAL;
+ 	}
++	if (pkgname_out != NULL)
++		xbps_strlcpy(pkgname_out, pkgname, pkgname_out_len);
+ 
+ 	rv = trans_find_pkg(xhp, pkgname, false);
+ 
+@@ -310,16 +376,95 @@ xbps_autoupdate(struct xbps_handle *xhp)
+ 	return 0;
+ }
+ 
++struct build_replaces_index_data {
++	xbps_dictionary_t index;
++};
++
++static int
++build_replaces_index_cb(struct xbps_repo *repo, void *arg, bool *done UNUSED)
++{
++	struct build_replaces_index_data *d = arg;
++	xbps_object_iterator_t iter;
++	xbps_object_t obj;
++
++	if (repo->idx == NULL)
++		return 0;
++
++	iter = xbps_dictionary_iterator(repo->idx);
++	if (iter == NULL)
++		return 0;
++
++	while ((obj = xbps_object_iterator_next(iter))) {
++		xbps_dictionary_t pkgd = xbps_dictionary_get_keysym(repo->idx, obj);
++		xbps_array_t replaces = xbps_dictionary_get(pkgd, "replaces");
++		const char *newpkgname = xbps_dictionary_keysym_cstring_nocopy(obj);
++		unsigned int j;
++
++		if (replaces == NULL || newpkgname == NULL)
++			continue;
++
++		for (j = 0; j < xbps_array_count(replaces); j++) {
++			const char *pattern = NULL;
++			char patname[XBPS_NAME_SIZE] = {0};
++
++			if (!xbps_array_get_cstring_nocopy(replaces, j, &pattern))
++				continue;
++			if (!xbps_pkgpattern_name(patname, sizeof(patname), pattern) &&
++			    !xbps_pkg_name(patname, sizeof(patname), pattern)) {
++				xbps_strlcpy(patname, pattern, sizeof(patname));
++			}
++			/*
++			 * First writer for a given old pkgname wins if two
++			 * different packages both claim to replace it --
++			 * an ambiguous setup, but not this code's job to
++			 * arbitrate; just don't crash or overwrite silently
++			 * back and forth across repos in an unstable order.
++			 */
++			if (!xbps_dictionary_get(d->index, patname))
++				xbps_dictionary_set_cstring(d->index, patname, newpkgname);
++		}
++	}
++	xbps_object_iterator_release(iter);
++	return 0;
++}
++
++/*
++ * Scans every repo *once* and builds a dictionary mapping
++ * "old pkgname that some package's replaces= array names" -> "the
++ * pkgname of the package that replaces it". Used by
++ * xbps_transaction_update_packages() below so that a plain sysupgrade
++ * (-Syu) picks up a rename/replaces-based package swap automatically,
++ * the same way an explicit `xbps-install <newpkg>` already does --
++ * even when the old package is *still* published in the repo pool
++ * (e.g. simply forgotten there rather than pruned), which is why this
++ * doesn't gate on the old package being missing: building the index
++ * once up front and doing an O(1) dictionary lookup per installed
++ * package is cheap enough to always check, unlike the alternative of
++ * rescanning the whole repo pool for every single installed package.
++ */
++static xbps_dictionary_t
++build_replaces_index(struct xbps_handle *xhp)
++{
++	struct build_replaces_index_data d;
++
++	d.index = xbps_dictionary_create();
++	if (d.index == NULL)
++		return NULL;
++	xbps_rpool_foreach(xhp, build_replaces_index_cb, &d);
++	return d.index;
++}
++
+ int
+ xbps_transaction_update_packages(struct xbps_handle *xhp)
+ {
+ 	xbps_object_t obj;
+ 	xbps_object_iterator_t iter;
+ 	xbps_dictionary_t pkgd;
++	xbps_dictionary_t replaces_idx;
+ 	bool newpkg_found = false;
+ 	int rv = 0;
+ 
+-	rv = xbps_autoupdate(xhp);
++	rv = xbps_autoupdate(xhp, NULL, 0);
+ 	switch (rv) {
+ 	case 1:
+ 		/* xbps needs to be updated, don't allow any other update */
+@@ -331,11 +476,14 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
+ 		break;
+ 	}
+ 
++	replaces_idx = build_replaces_index(xhp);
++
+ 	iter = xbps_dictionary_iterator(xhp->pkgdb);
+ 	assert(iter);
+ 
+ 	while ((obj = xbps_object_iterator_next(iter))) {
+ 		const char *pkgver = NULL;
++		const char *newpkgname = NULL;
+ 		char pkgname[XBPS_NAME_SIZE] = {0};
+ 
+ 		pkgd = xbps_dictionary_get_keysym(xhp->pkgdb, obj);
+@@ -346,8 +494,46 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
+ 			rv = EINVAL;
+ 			break;
+ 		}
++		/*
++		 * Normal same-name lookup first, same as always.
++		 */
+ 		rv = trans_find_pkg(xhp, pkgname, false);
+ 		xbps_dbg_printf("%s: trans_find_pkg %s: %d\n", __func__, pkgver, rv);
++
++		if ((rv == ENOENT || rv == EEXIST) &&
++		    xbps_rpool_get_pkg(xhp, pkgname) == NULL &&
++		    xbps_pkgdb_get_virtualpkg(xhp, pkgname) == NULL) {
++			/*
++			 * pkgname genuinely does not exist anywhere in the
++			 * repo pool under its own name (checked directly,
++			 * not just trusting trans_find_pkg's exact return
++			 * code, which has been observed to come back as
++			 * either ENOENT or EEXIST depending on what else is
++			 * registered). Only in that case -- the package was
++			 * truly dropped from the repo, not merely sitting
++			 * alongside its replacement -- consult the
++			 * pre-built replaces index (O(1)) to see if some
++			 * other package now replaces it, and pull that one
++			 * in instead, exactly as if the user had run
++			 * `xbps-install newpkgname` explicitly.
++			 *
++			 * Deliberately NOT done when the old package is
++			 * still present and valid in the repo pool: that
++			 * would mean any repo's replaces= entry could
++			 * silently swap out an otherwise perfectly normal,
++			 * unrelated package (e.g. firefox -> firefox-esr)
++			 * during a routine sysupgrade, with no signal that
++			 * anything unusual is happening.
++			 */
++			if (replaces_idx != NULL &&
++			    xbps_dictionary_get_cstring_nocopy(replaces_idx, pkgname, &newpkgname)) {
++				xbps_dbg_printf("%s: %s replaced by %s\n",
++				    __func__, pkgname, newpkgname);
++				rv = trans_find_pkg(xhp, newpkgname, false);
++				xbps_dbg_printf("%s: trans_find_pkg %s (replacement): %d\n",
++				    __func__, newpkgname, rv);
++			}
++		}
+ 		if (rv == 0) {
+ 			newpkg_found = true;
+ 		} else if (rv == ENOENT || rv == EEXIST || rv == ENODEV) {
+@@ -359,6 +545,8 @@ xbps_transaction_update_packages(struct xbps_handle *xhp)
+ 		}
+ 	}
+ 	xbps_object_iterator_release(iter);
++	if (replaces_idx != NULL)
++		xbps_object_release(replaces_idx);
+ 
+ 	return newpkg_found ? rv : EEXIST;
+ }
+@@ -367,14 +555,20 @@ int
+ xbps_transaction_update_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
+ {
+ 	xbps_array_t rdeps;
++	char xbps_pkgname[XBPS_NAME_SIZE] = {0};
+ 	int rv;
+ 
+-	rv = xbps_autoupdate(xhp);
++	rv = xbps_autoupdate(xhp, xbps_pkgname, sizeof(xbps_pkgname));
+ 	xbps_dbg_printf("%s: xbps_autoupdate %d\n", __func__, rv);
+ 	switch (rv) {
+ 	case 1:
+-		/* xbps needs to be updated, only allow xbps to be updated */
+-		if (strcmp(pkg, "xbps"))
++		/*
++		 * xbps needs to be updated, only allow the package that
++		 * actually provides "xbps" to be updated (may not
++		 * literally be named "xbps" -- e.g. a distro's own fork
++		 * that replaces/provides it under a different name).
++		 */
++		if (strcmp(pkg, "xbps") && strcmp(pkg, xbps_pkgname))
+ 			return EBUSY;
+ 		return 0;
+ 	case -1:
+@@ -415,13 +609,18 @@ int
+ xbps_transaction_install_pkg(struct xbps_handle *xhp, const char *pkg, bool force)
+ {
+ 	xbps_array_t rdeps;
++	char xbps_pkgname[XBPS_NAME_SIZE] = {0};
+ 	int rv;
+ 
+-	rv = xbps_autoupdate(xhp);
++	rv = xbps_autoupdate(xhp, xbps_pkgname, sizeof(xbps_pkgname));
+ 	switch (rv) {
+ 	case 1:
+-		/* xbps needs to be updated, only allow xbps to be updated */
+-		if (strcmp(pkg, "xbps"))
++		/*
++		 * xbps needs to be updated, only allow the package that
++		 * actually provides "xbps" to be updated (may not
++		 * literally be named "xbps" -- see xbps_autoupdate()).
++		 */
++		if (strcmp(pkg, "xbps") && strcmp(pkg, xbps_pkgname))
+ 			return EBUSY;
+ 		return 0;
+ 	case -1:
