@@ -1,8 +1,8 @@
 diff --git a/bin/xbps-install/defs.h b/bin/xbps-install/defs.h
-index e7933d2..c095c1c 100644
+index e7933d2..413f1b4 100644
 --- a/bin/xbps-install/defs.h
 +++ b/bin/xbps-install/defs.h
-@@ -58,9 +58,15 @@ bool	noyes(const char *, ...);
+@@ -58,9 +58,16 @@ bool	noyes(const char *, ...);
  
  /* from fetch_cb.c */
  void	fetch_file_progress_cb(const struct xbps_fetch_cb_data *, void *);
@@ -10,6 +10,7 @@ index e7933d2..c095c1c 100644
 +void	progress_bar(char *, size_t, int, int);
 +unsigned int	progress_frame(void);
 +int	progress_bar_width(int);
++void	progress_line(unsigned int, unsigned int, const char *, int, bool);
  
  /* from state_cb.c */
  int	state_cb(const struct xbps_state_cb_data *, void *);
@@ -19,7 +20,7 @@ index e7933d2..c095c1c 100644
  /* From util.c */
  void	print_package_line(const char *, unsigned int, bool);
 diff --git a/bin/xbps-install/fetch_cb.c b/bin/xbps-install/fetch_cb.c
-index f9860fe..252afb8 100644
+index f9860fe..26c240a 100644
 --- a/bin/xbps-install/fetch_cb.c
 +++ b/bin/xbps-install/fetch_cb.c
 @@ -30,6 +30,8 @@
@@ -39,7 +40,7 @@ index f9860fe..252afb8 100644
  #include <time.h>
  #include <unistd.h>
  
-@@ -183,12 +186,592 @@ stat_display(const struct xbps_fetch_cb_data *xfpd, void *cbdata)
+@@ -183,12 +186,632 @@ stat_display(const struct xbps_fetch_cb_data *xfpd, void *cbdata)
  	}
  }
  
@@ -120,6 +121,46 @@ index f9860fe..252afb8 100644
 +	if (cols - 34 - barw < 16)
 +		barw = 10;
 +	return barw;
++}
++
++/*
++ * Draws a pacman-style numbered line on stdout, without a newline:
++ *   (37/120) label ......................... [bar]  30%
++ * The text takes everything up to the bar, which sits in the same
++ * columns as the download bars (progress_bar_width()). Used by
++ * xbps-install (state_cb.c) and xbps-reconfigure.
++ */
++void
++progress_line(unsigned int done, unsigned int total, const char *label,
++    int pct, bool withbar)
++{
++	struct winsize ws;
++	char left[256], bar[512];
++	int cols = 80, barw, nw, leftw, labelw;
++
++	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
++		cols = ws.ws_col;
++	if (total < done)
++		total = done;
++	nw = snprintf(NULL, 0, "%u", total);
++
++	barw = progress_bar_width(cols);
++	leftw = cols - barw - 8;
++	labelw = leftw - (2 * nw + 4);
++	if (labelw < 8)
++		labelw = 8;
++	snprintf(left, sizeof left, "(%*u/%u) %.*s", nw, done, total,
++	    labelw, label);
++	if (leftw < (int)strlen(left))
++		leftw = (int)strlen(left);
++
++	if (!withbar) {
++		printf("\r%s\033[K", left);
++	} else {
++		progress_bar(bar, sizeof bar, barw, pct);
++		printf("\r%-*s [%s] %3d%%\033[K", leftw, left, bar, pct);
++	}
++	fflush(stdout);
 +}
 +
 +unsigned int
@@ -757,10 +798,10 @@ index 41c543c..17bfcec 100644
  	maxcols = get_maxcols();
  
 diff --git a/bin/xbps-install/state_cb.c b/bin/xbps-install/state_cb.c
-index 63fc574..af55cbb 100644
+index 63fc574..49ff994 100644
 --- a/bin/xbps-install/state_cb.c
 +++ b/bin/xbps-install/state_cb.c
-@@ -23,14 +23,333 @@
+@@ -23,14 +23,361 @@
   * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
   */
  
@@ -826,38 +867,7 @@ index 63fc574..af55cbb 100644
 +line_print(unsigned int done, unsigned int total, const char *label,
 +    int pct, bool withbar)
 +{
-+	char left[256], bar[512];
-+	int cols, barw, nw, leftw, labelw;
-+
-+	cols = get_maxcols();
-+	if (cols <= 0)
-+		cols = 80;
-+	if (total < done)
-+		total = done;
-+	nw = snprintf(NULL, 0, "%u", total);
-+
-+	/*
-+	 * Same bar width and columns as the download lines (see
-+	 * progress_bar_width()): the text takes everything up to the bar.
-+	 */
-+	barw = progress_bar_width(cols);
-+	leftw = cols - barw - 8;
-+	labelw = leftw - (2 * nw + 4);
-+	if (labelw < 8)
-+		labelw = 8;
-+	snprintf(left, sizeof left, "(%*u/%u) %.*s", nw, done, total,
-+	    labelw, label);
-+	if (leftw < (int)strlen(left))
-+		leftw = (int)strlen(left);
-+
-+	if (!withbar) {
-+		printf("\r%s\033[K", left);
-+		fflush(stdout);
-+		return;
-+	}
-+	progress_bar(bar, sizeof bar, barw, pct);
-+	printf("\r%-*s [%s] %3d%%\033[K", leftw, left, bar, pct);
-+	fflush(stdout);
++	progress_line(done, total, label, pct, withbar);
 +}
 +
 +static void
@@ -876,16 +886,23 @@ index 63fc574..af55cbb 100644
 + *   ( 1/6) Unpacking pt1-1.0_1                [■■■■■■■■■■■■■⠹□□□□□]  70%
 + *   ( 2/6) Updating pt2-1.0_1 -> 1.0_2        [■■■■■■■■■■■■■■■■■■■] 100%
 + *   ( 3/6) Removing pt7-1.0_1
-+ *   ( 1/5) Configuring pt1-1.0_1
 + * The unpack bar follows the files extracted (unpack callback). Every
 + * line ends with a newline before the next package, so output of the
 + * packages' INSTALL/REMOVE scripts lands between lines, never inside.
++ *
++ * The configure step uses a single line instead, redrawn in place, the
++ * same as xbps-reconfigure:
++ *   ( 3/5) Configuring alfa-1.0_2 ................. [■■■■■■■■■⠹□□□□□□]  60%
++ * A package with an INSTALL script ends the line before its post-install
++ * script runs, so the script's output shows up below it; at the end the
++ * line reads "Configuring packages".
 + * Only on a terminal and without -d or -v.
 + */
 +static struct {
 +	bool active;		/* per-package lines for this step */
 +	bool open;		/* a line with a bar is on screen, no newline */
 +	bool bar;
++	bool configure;		/* configure step: one line, redrawn in place */
 +	bool suspended;		/* closed to let a message through */
 +	unsigned int total;
 +	unsigned int done;
@@ -945,6 +962,7 @@ index 63fc574..af55cbb 100644
 +	pk_close(true);
 +	memset(&pk, 0, sizeof pk);
 +	pk.total = count_step_pkgs(xhp, configure);
++	pk.configure = configure;
 +	pk.active = isatty(STDOUT_FILENO) &&
 +	    !(xhp->flags & (XBPS_FLAG_DEBUG | XBPS_FLAG_VERBOSE));
 +}
@@ -1016,11 +1034,62 @@ index 63fc574..af55cbb 100644
 +	pk_draw();
 +}
 +
++static bool
++has_install_script(struct xbps_handle *xhp, const char *pkgver)
++{
++	char pkgname[XBPS_NAME_SIZE];
++	xbps_dictionary_t pkgd;
++
++	if (!xbps_pkg_name(pkgname, sizeof pkgname, pkgver))
++		xbps_strlcpy(pkgname, pkgver, sizeof pkgname);
++	pkgd = xbps_pkgdb_get_pkg(xhp, pkgname);
++	/* can't tell: play safe and give the line back */
++	return pkgd == NULL || xbps_dictionary_get(pkgd, "install-script") != NULL;
++}
++
++static void
++pk_configure_step(struct xbps_handle *xhp, const char *pkgver)
++{
++	pk.done++;
++	pk.bar = true;
++	pk.pct = pk.total ? (int)(pk.done * 100 / pk.total) : 100;
++	if (pk.pct > 100)
++		pk.pct = 100;
++	snprintf(pk.label, sizeof pk.label, "Configuring %s", pkgver);
++	pk_draw();
++	pk.open = true;
++	/* let the post-install script print below the line */
++	if (has_install_script(xhp, pkgver)) {
++		printf("\n");
++		fflush(stdout);
++		pk.open = false;
++	}
++}
++
++/* ends the configure line with its final picture */
++static void
++pk_configure_finish(bool ok)
++{
++	if (ok && pk.done > 0) {
++		if (pk.done < pk.total)
++			pk.done = pk.total;
++		pk.pct = 100;
++		pk.bar = true;
++		snprintf(pk.label, sizeof pk.label, "Configuring packages");
++		pk_draw();
++		pk.open = true;
++	}
++	pk_close(false);
++}
++
 +/* ends whatever line is still open (e.g. with -U there is no configure step) */
 +void
 +state_lines_finish(void)
 +{
-+	pk_close(true);
++	if (pk.active && pk.configure)
++		pk_configure_finish(true);
++	else
++		pk_close(true);
 +	pk.active = false;
 +}
 +
@@ -1094,7 +1163,7 @@ index 63fc574..af55cbb 100644
  int
  state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  {
-@@ -45,22 +364,90 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -45,22 +392,93 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  		openlog("xbps-install", 0, LOG_USER);
  	}
  
@@ -1144,7 +1213,10 @@ index 63fc574..af55cbb 100644
 +			pk_suspend();
 +			break;
 +		default:
-+			pk_close(!is_fail_state(xscd->state));
++			if (pk.configure)
++				pk_configure_finish(!is_fail_state(xscd->state));
++			else
++				pk_close(!is_fail_state(xscd->state));
 +			if (xscd->state != XBPS_STATE_TRANS_CONFIGURE)
 +				pk.active = false;
 +			break;
@@ -1189,7 +1261,7 @@ index 63fc574..af55cbb 100644
  		break;
  	case XBPS_STATE_TRANS_HOOKS:
  		if (xscd->desc[0] == '(')
-@@ -79,26 +466,45 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -79,26 +497,45 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  			printf("%s\n", xscd->desc);
  		break;
  	case XBPS_STATE_VERIFY:
@@ -1220,7 +1292,7 @@ index 63fc574..af55cbb 100644
  	case XBPS_STATE_CONFIGURE:
 -		printf("%s: configuring ...\n", xscd->arg);
 +		if (pk.active)
-+			pk_new_line(xscd->arg, false, "Configuring %s", xscd->arg);
++			pk_configure_step(xscd->xhp, xscd->arg);
 +		else
 +			printf("%s: configuring ...\n", xscd->arg);
  		break;
@@ -1240,7 +1312,7 @@ index 63fc574..af55cbb 100644
  		break;
  	case XBPS_STATE_INSTALL:
  	case XBPS_STATE_DOWNLOAD:
-@@ -112,7 +518,11 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -112,7 +549,11 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  			xbps_unreachable();
  		pkgd = xbps_pkgdb_get_pkg(xscd->xhp, pkgname);
  		xbps_dictionary_get_cstring_nocopy(pkgd, "pkgver", &instver);
@@ -1253,7 +1325,7 @@ index 63fc574..af55cbb 100644
  		if (slog) {
  			syslog(LOG_NOTICE, "%s: updating to %s ... "
  			    "(rootdir: %s)\n", instver, newver,
-@@ -122,6 +532,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -122,6 +563,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  	/* success */
  	case XBPS_STATE_REMOVE_FILE:
  	case XBPS_STATE_REMOVE_FILE_OBSOLETE:
@@ -1262,7 +1334,7 @@ index 63fc574..af55cbb 100644
  		if (xscd->xhp->flags & XBPS_FLAG_VERBOSE)
  			printf("%s\n", xscd->desc);
  		else {
-@@ -130,7 +542,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -130,7 +573,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  		}
  		break;
  	case XBPS_STATE_INSTALL_DONE:
@@ -1272,7 +1344,7 @@ index 63fc574..af55cbb 100644
  		if (slog) {
  			syslog(LOG_NOTICE, "Installed `%s' successfully "
  			    "(rootdir: %s).", xscd->arg,
-@@ -138,7 +551,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -138,7 +582,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  		}
  		break;
  	case XBPS_STATE_UPDATE_DONE:
@@ -1282,7 +1354,7 @@ index 63fc574..af55cbb 100644
  		if (slog) {
  			syslog(LOG_NOTICE, "Updated `%s' successfully "
  			    "(rootdir: %s).", xscd->arg,
-@@ -146,7 +560,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -146,7 +591,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  		}
  		break;
  	case XBPS_STATE_REMOVE_DONE:
@@ -1292,7 +1364,7 @@ index 63fc574..af55cbb 100644
  		if (slog) {
  			syslog(LOG_NOTICE, "Removed `%s' successfully "
  			    "(rootdir: %s).", xscd->arg,
-@@ -203,5 +618,6 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -203,5 +649,6 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  		break;
  	}
  
@@ -1350,6 +1422,253 @@ index 020edff..491fa7c 100644
  .El
  .Sh FILES
  .Bl -tag -width /var/db/xbps/.<pkgname>-files.plist
+diff --git a/bin/xbps-reconfigure/Makefile b/bin/xbps-reconfigure/Makefile
+index dfe161c..3a969c9 100644
+--- a/bin/xbps-reconfigure/Makefile
++++ b/bin/xbps-reconfigure/Makefile
+@@ -3,5 +3,6 @@ TOPDIR = ../..
+ 
+ BIN =	xbps-reconfigure
+ OBJS =	main.o find-deps.o
++OBJS +=	../xbps-install/fetch_cb.o
+ 
+ include $(TOPDIR)/mk/prog.mk
+diff --git a/bin/xbps-reconfigure/defs.h b/bin/xbps-reconfigure/defs.h
+index 4e6bed3..a0fbe24 100644
+--- a/bin/xbps-reconfigure/defs.h
++++ b/bin/xbps-reconfigure/defs.h
+@@ -31,4 +31,7 @@
+ /* from find-deps.c */
+ int	find_pkg_deps(struct xbps_handle *, const char *, bool, xbps_array_t *);
+ 
++/* from ../xbps-install/fetch_cb.c */
++void	progress_line(unsigned int, unsigned int, const char *, int, bool);
++
+ #endif /* !_XBPS_RECONFIGURE_DEFS_H_ */
+diff --git a/bin/xbps-reconfigure/main.c b/bin/xbps-reconfigure/main.c
+index ec4df44..ee6a1a2 100644
+--- a/bin/xbps-reconfigure/main.c
++++ b/bin/xbps-reconfigure/main.c
+@@ -54,6 +54,120 @@ usage(bool fail)
+ 	exit(fail ? EXIT_FAILURE : EXIT_SUCCESS);
+ }
+ 
++/*
++ * pacman-style progress on a terminal (not with -d or -v): a single
++ * numbered line redrawn in place,
++ *   (37/120) Configuring libmount-2.41.4_1 ........ [■■■■■■⠹□□□□□□□]  30%
++ * instead of "pkg: configuring ..." + "pkg: configured successfully."
++ * for every package. A package with an INSTALL script ends the line
++ * before the script runs, so whatever the script prints shows up below
++ * it instead of on top of it; the next packages go on a new line.
++ * When everything is done the line reads "Configuring packages".
++ */
++static struct {
++	bool active;
++	bool open;
++	unsigned int total;
++	unsigned int done;
++	char label[XBPS_NAME_SIZE * 2 + 16];
++} cfg;
++
++/* will xbps_configure_pkg(xhp, name, true, false) do anything? */
++static bool
++will_configure(struct xbps_handle *xhp, const char *name)
++{
++	xbps_dictionary_t pkgd;
++	pkg_state_t state = 0;
++
++	if ((pkgd = xbps_pkgdb_get_pkg(xhp, name)) == NULL)
++		return false;
++	if (xbps_pkg_state_dictionary(pkgd, &state) != 0)
++		return false;
++	if (state == XBPS_PKG_STATE_UNPACKED)
++		return true;
++	return state == XBPS_PKG_STATE_INSTALLED &&
++	    (xhp->flags & XBPS_FLAG_FORCE_CONFIGURE);
++}
++
++/* same walk as xbps_configure_packages() */
++static unsigned int
++count_all(struct xbps_handle *xhp, xbps_array_t ignpkgs)
++{
++	xbps_object_iterator_t iter;
++	xbps_object_t obj;
++	unsigned int n = 0;
++
++	/* no public API to load the pkgdb: any lookup does it */
++	(void)xbps_pkgdb_get_pkg(xhp, "package-that-wont-exist");
++	if (xhp->pkgdb == NULL)
++		return 0;
++	iter = xbps_dictionary_iterator(xhp->pkgdb);
++	if (iter == NULL)
++		return 0;
++	while ((obj = xbps_object_iterator_next(iter))) {
++		xbps_dictionary_t pkgd;
++		const char *pkgver = NULL;
++
++		pkgd = xbps_dictionary_get_keysym(xhp->pkgdb, obj);
++		if (!xbps_dictionary_get_cstring_nocopy(pkgd, "pkgver", &pkgver))
++			continue;
++		if (xbps_array_count(ignpkgs) &&
++		    (xbps_match_string_in_array(ignpkgs, pkgver) ||
++		    xbps_match_pkgver_in_array(ignpkgs, pkgver)))
++			continue;
++		if (will_configure(xhp, pkgver))
++			n++;
++	}
++	xbps_object_iterator_release(iter);
++	return n;
++}
++
++static void
++cfg_draw(void)
++{
++	progress_line(cfg.done, cfg.total, cfg.label,
++	    cfg.total ? (int)(cfg.done * 100 / cfg.total) : 100, true);
++	cfg.open = true;
++}
++
++static void
++cfg_close(void)
++{
++	if (cfg.open) {
++		printf("\n");
++		fflush(stdout);
++	}
++	cfg.open = false;
++}
++
++static bool
++has_install_script(struct xbps_handle *xhp, const char *pkgver)
++{
++	char pkgname[XBPS_NAME_SIZE];
++	xbps_dictionary_t pkgd;
++
++	/* "foo-1.0_1" from -a, or just "foo" from the command line */
++	if (!xbps_pkg_name(pkgname, sizeof pkgname, pkgver))
++		xbps_strlcpy(pkgname, pkgver, sizeof pkgname);
++	pkgd = xbps_pkgdb_get_pkg(xhp, pkgname);
++	/* can't tell: play safe and give the line back */
++	return pkgd == NULL || xbps_dictionary_get(pkgd, "install-script") != NULL;
++}
++
++/* the final picture, once every package is done */
++static void
++cfg_finish(bool ok)
++{
++	if (!cfg.active)
++		return;
++	if (ok && cfg.done > 0) {
++		cfg.done = cfg.total > cfg.done ? cfg.total : cfg.done;
++		snprintf(cfg.label, sizeof cfg.label, "Configuring packages");
++		cfg_draw();
++	}
++	cfg_close();
++}
++
+ static int
+ state_cb(const struct xbps_state_cb_data *xscd, void *cbd UNUSED)
+ {
+@@ -67,18 +181,30 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbd UNUSED)
+ 	switch (xscd->state) {
+ 	/* notifications */
+ 	case XBPS_STATE_CONFIGURE:
+-		printf("%s: configuring ...\n", xscd->arg);
++		if (cfg.active) {
++			cfg.done++;
++			snprintf(cfg.label, sizeof cfg.label, "Configuring %s",
++			    xscd->arg);
++			cfg_draw();
++			/* let the INSTALL script print below the line */
++			if (has_install_script(xscd->xhp, xscd->arg))
++				cfg_close();
++		} else {
++			printf("%s: configuring ...\n", xscd->arg);
++		}
+ 		if (slog)
+ 			syslog(LOG_NOTICE, "%s: configuring ...", xscd->arg);
+ 		break;
+ 	case XBPS_STATE_CONFIGURE_DONE:
+-		printf("%s: configured successfully.\n", xscd->arg);
++		if (!cfg.active)
++			printf("%s: configured successfully.\n", xscd->arg);
+ 		if (slog)
+ 			syslog(LOG_NOTICE,
+ 			    "%s: configured successfully.", xscd->arg);
+ 		break;
+ 	/* errors */
+ 	case XBPS_STATE_CONFIGURE_FAIL:
++		cfg_close();
+ 		xbps_error_printf("%s\n", xscd->desc);
+ 		if (slog)
+ 			syslog(LOG_ERR, "%s", xscd->desc);
+@@ -183,6 +309,18 @@ main(int argc, char **argv)
+ 		exit(EXIT_FAILURE);
+ 	}
+ 
++	cfg.active = isatty(STDOUT_FILENO) &&
++	    !(flags & (XBPS_FLAG_DEBUG | XBPS_FLAG_VERBOSE));
++	if (cfg.active) {
++		if (all) {
++			cfg.total = count_all(&xh, ignpkgs);
++		} else {
++			for (i = optind; i < argc; i++)
++				if (will_configure(&xh, argv[i]))
++					cfg.total++;
++		}
++	}
++
+ 	if (all) {
+ 		rv = xbps_configure_packages(&xh, ignpkgs);
+ 	} else {
+@@ -191,9 +329,24 @@ main(int argc, char **argv)
+ 			if (rdeps) {
+ 				rv = find_pkg_deps(&xh, pkg, fulldeptree, &deps);
+ 				if (rv != 0) {
++					cfg_close();
+ 					xbps_error_printf("failed to collect dependencies for "
+ 						"`%s': %s\n", pkg, strerror(rv));
+ 				}
++				if (cfg.active) {
++					/* the dependencies are counted as they come */
++					for (unsigned int j = 0; j < xbps_array_count(deps); j++) {
++						const char *d = NULL;
++						char dn[XBPS_NAME_SIZE];
++
++						xbps_array_get_cstring_nocopy(deps, j, &d);
++						if (d != NULL &&
++						    (fulldeptree ? xbps_pkg_name(dn, sizeof dn, d) :
++						    xbps_pkgpattern_name(dn, sizeof dn, d)) &&
++						    will_configure(&xh, dn))
++							cfg.total++;
++					}
++				}
+ 				for (unsigned int j = 0; j < xbps_array_count(deps); j++) {
+ 					const char *pkgdep = NULL;
+ 					char pkgname[XBPS_NAME_SIZE];
+@@ -215,6 +368,7 @@ main(int argc, char **argv)
+ 
+ 					rv = xbps_configure_pkg(&xh, pkgname, true, false);
+ 					if (rv != 0) {
++						cfg_close();
+ 						xbps_error_printf("failed to reconfigure "
+ 							"`%s': %s\n", pkgname, strerror(rv));
+ 					}
+@@ -222,11 +376,13 @@ main(int argc, char **argv)
+ 			}
+ 			rv = xbps_configure_pkg(&xh, pkg, true, false);
+ 			if (rv != 0) {
++				cfg_close();
+ 				xbps_error_printf("failed to reconfigure "
+ 				    "`%s': %s\n", pkg, strerror(rv));
+ 			}
+ 		}
+ 	}
++	cfg_finish(rv == 0);
+ 	if (rv == 0)
+ 		xbps_pkgdb_update(&xh, true, false);
+ 
 diff --git a/data/xbps.d.5 b/data/xbps.d.5
 index 3c5101b..3f58f50 100644
 --- a/data/xbps.d.5
