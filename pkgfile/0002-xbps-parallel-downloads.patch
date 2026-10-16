@@ -1,18 +1,24 @@
 diff --git a/bin/xbps-install/defs.h b/bin/xbps-install/defs.h
-index e7933d2..9ad89c9 100644
+index e7933d2..d9be033 100644
 --- a/bin/xbps-install/defs.h
 +++ b/bin/xbps-install/defs.h
-@@ -58,6 +58,8 @@ bool	noyes(const char *, ...);
+@@ -58,9 +58,14 @@ bool	noyes(const char *, ...);
  
  /* from fetch_cb.c */
  void	fetch_file_progress_cb(const struct xbps_fetch_cb_data *, void *);
 +void	fetch_parallel_finish(struct xbps_handle *);
 +void	progress_bar(char *, size_t, int, int);
++unsigned int	progress_frame(void);
  
  /* from state_cb.c */
  int	state_cb(const struct xbps_state_cb_data *, void *);
++void	state_unpack_progress(const struct xbps_unpack_cb_data *);
++void	state_lines_finish(void) __attribute__((weak));
+ 
+ /* From util.c */
+ void	print_package_line(const char *, unsigned int, bool);
 diff --git a/bin/xbps-install/fetch_cb.c b/bin/xbps-install/fetch_cb.c
-index f9860fe..315f561 100644
+index f9860fe..7d8e37e 100644
 --- a/bin/xbps-install/fetch_cb.c
 +++ b/bin/xbps-install/fetch_cb.c
 @@ -30,6 +30,8 @@
@@ -32,7 +38,7 @@ index f9860fe..315f561 100644
  #include <time.h>
  #include <unistd.h>
  
-@@ -183,12 +186,573 @@ stat_display(const struct xbps_fetch_cb_data *xfpd, void *cbdata)
+@@ -183,12 +186,579 @@ stat_display(const struct xbps_fetch_cb_data *xfpd, void *cbdata)
  	}
  }
  
@@ -96,6 +102,12 @@ index f9860fe..315f561 100644
 +
 +	get_time(&tv);
 +	return (unsigned int)((tv.tv_sec * 1000 + tv.tv_usec / 1000) / SPIN_MS);
++}
++
++unsigned int
++progress_frame(void)
++{
++	return bar_frame();
 +}
 +
 +void
@@ -607,7 +619,7 @@ index f9860fe..315f561 100644
  		/* start transfer stats */
  		v_tty = isatty(STDOUT_FILENO);
 diff --git a/bin/xbps-install/main.c b/bin/xbps-install/main.c
-index 41c543c..4a3d5ac 100644
+index 41c543c..17bfcec 100644
 --- a/bin/xbps-install/main.c
 +++ b/bin/xbps-install/main.c
 @@ -38,6 +38,26 @@
@@ -647,7 +659,19 @@ index 41c543c..4a3d5ac 100644
  	    " -R, --repository <url>      Add repository to the top of the list\n"
  	    "                             This option can be specified multiple times\n"
  	    " -r, --rootdir <dir>         Full path to rootdir\n"
-@@ -129,6 +152,7 @@ main(int argc, char **argv)
+@@ -80,6 +103,11 @@ usage(bool fail)
+ static void
+ unpack_progress_cb(const struct xbps_unpack_cb_data *xpd, void *cbdata UNUSED)
+ {
++	if (!(xpd->xhp->flags & XBPS_FLAG_VERBOSE)) {
++		/* bar of the "Unpacking ..." line, see state_cb.c */
++		state_unpack_progress(xpd);
++		return;
++	}
+ 	if (xpd->entry == NULL || xpd->entry_total_count <= 0)
+ 		return;
+ 
+@@ -129,6 +157,7 @@ main(int argc, char **argv)
  		{ "yes", no_argument, NULL, 'y' },
  		{ "reproducible", no_argument, NULL, 1 },
  		{ "staging", no_argument, NULL, 2 },
@@ -655,7 +679,7 @@ index 41c543c..4a3d5ac 100644
  		{ NULL, 0, NULL, 0 }
  	};
  	struct xbps_handle xh;
-@@ -136,7 +160,7 @@ main(int argc, char **argv)
+@@ -136,7 +165,7 @@ main(int argc, char **argv)
  	const char *rootdir, *cachedir, *confdir;
  	int i, c, flags, rv, fflag = 0, clean_cache = 0;
  	bool syncf, yes, force, drun, update, orphans;
@@ -664,7 +688,7 @@ index 41c543c..4a3d5ac 100644
  
  	rootdir = cachedir = confdir = NULL;
  	flags = rv = 0;
-@@ -152,6 +176,14 @@ main(int argc, char **argv)
+@@ -152,6 +181,14 @@ main(int argc, char **argv)
  		case 2:
  			flags |= XBPS_FLAG_USE_STAGE;
  			break;
@@ -679,7 +703,17 @@ index 41c543c..4a3d5ac 100644
  		case 'A':
  			flags |= XBPS_FLAG_INSTALL_AUTO;
  			break;
-@@ -248,6 +280,28 @@ main(int argc, char **argv)
+@@ -240,14 +277,36 @@ main(int argc, char **argv)
+ 	if (confdir)
+ 		xbps_strlcpy(xh.confdir, confdir, sizeof(xh.confdir));
+ 	xh.flags = flags;
+-	if (flags & XBPS_FLAG_VERBOSE)
+-		xh.unpack_cb = unpack_progress_cb;
++	/* -v lists every file, otherwise it drives the unpack bar */
++	xh.unpack_cb = unpack_progress_cb;
+ 
+ 	if ((rv = xbps_init(&xh)) != 0) {
+ 		xbps_error_printf("Failed to initialize libxbps: %s\n",
  		    strerror(rv));
  		exit(EXIT_FAILURE);
  	}
@@ -709,10 +743,16 @@ index 41c543c..4a3d5ac 100644
  	maxcols = get_maxcols();
  
 diff --git a/bin/xbps-install/state_cb.c b/bin/xbps-install/state_cb.c
-index 63fc574..352b867 100644
+index 63fc574..ede3bd4 100644
 --- a/bin/xbps-install/state_cb.c
 +++ b/bin/xbps-install/state_cb.c
-@@ -28,9 +28,88 @@
+@@ -23,14 +23,329 @@
+  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++#include <stdarg.h>
+ #include <stdlib.h>
+ #include <string.h>
  #include <errno.h>
  #include <syslog.h>
  #include <assert.h>
@@ -721,21 +761,34 @@ index 63fc574..352b867 100644
  #include "defs.h"
  
 +/*
-+ * pacman-style integrity check display: one line, redrawn in place,
-+ *   (37/120) checking package integrity       [#######----------]  30%
-+ * instead of one "pkg: verifying ..." line per package. Only on a
-+ * terminal and without -d; otherwise the per-package lines are kept,
-+ * since they are what a log needs.
++ * pacman-style phase lines: one line per phase, redrawn in place,
++ *   (37/120) Verifying package integrity      [■■■■■■⠹□□□□□□□□□□]  30%
++ *   (37/120) Collecting package files         [■■■■■■⠹□□□□□□□□□□]  30%
++ * instead of one "pkg: ..." line per package, with the bars of every
++ * phase lined up. The labels are the same texts xbps has always used
++ * for these phases, so nothing new to learn. Only on a terminal and without -d; otherwise the
++ * per-package lines (and the "[*] ..." headers) are kept, since they
++ * are what a log needs.
 + */
++/*
++ * Every numbered line (phases above, and the per-package lines of the
++ * unpack and configure steps below) has a fixed-width left part, so
++ * their bars line up. Longer labels are cut.
++ */
++#define LINE_LABEL_W	44
++
 +static struct {
++	const char *label;
 +	unsigned int total;
 +	unsigned int done;
-+	bool active;	/* counting packages for the current transaction */
++	char last[XBPS_NAME_SIZE];	/* package of the last step */
++	bool active;	/* counting packages for the current phase */
 +	bool open;	/* a line is on screen without its final newline */
-+} vfy;
++} ph;
 +
++/* packages that go through the integrity check / file collection */
 +static unsigned int
-+count_verify_pkgs(struct xbps_handle *xhp)
++count_phase_pkgs(struct xbps_handle *xhp, bool with_removes)
 +{
 +	xbps_array_t pkgs;
 +	unsigned int i, n = 0;
@@ -747,7 +800,99 @@ index 63fc574..352b867 100644
 +		xbps_trans_type_t ttype;
 +
 +		ttype = xbps_transaction_pkg_type(xbps_array_get(pkgs, i));
-+		if (ttype == XBPS_TRANS_REMOVE || ttype == XBPS_TRANS_HOLD ||
++		if (ttype == XBPS_TRANS_HOLD || ttype == XBPS_TRANS_CONFIGURE)
++			continue;
++		if (ttype == XBPS_TRANS_REMOVE && !with_removes)
++			continue;
++		n++;
++	}
++	return n;
++}
++
++static void
++line_print(unsigned int done, unsigned int total, const char *label,
++    int pct, bool withbar)
++{
++	char left[128], bar[2048];
++	int cols, barw, nw, leftw;
++
++	cols = get_maxcols();
++	if (cols <= 0)
++		cols = 80;
++	if (total < done)
++		total = done;
++	nw = snprintf(NULL, 0, "%u", total);
++	snprintf(left, sizeof left, "(%*u/%u) %.*s", nw, done, total,
++	    LINE_LABEL_W, label);
++	leftw = 2 * nw + 4 + LINE_LABEL_W;
++
++	if (!withbar) {
++		printf("\r%s\033[K", left);
++		fflush(stdout);
++		return;
++	}
++	/* left + " [" + bar + "] " + "100%", one column spare */
++	barw = cols - leftw - 2 - 2 - 4 - 1;
++	if (barw > 120)
++		barw = 120;
++	if (barw < 10)
++		barw = 10;
++	progress_bar(bar, sizeof bar, barw, pct);
++	printf("\r%-*s [%s] %3d%%\033[K", leftw, left, bar, pct);
++	fflush(stdout);
++}
++
++static void
++phase_draw(void)
++{
++	unsigned int total = ph.total > ph.done ? ph.total : ph.done;
++
++	line_print(ph.done, total, ph.label,
++	    total ? (int)(ph.done * 100 / total) : 100, true);
++	ph.open = true;
++}
++
++/*
++ * Unpack and configure steps: one numbered line per package, like
++ * pacman's "(1/6) installing ...", using the texts xbps already shows:
++ *   ( 1/6) Unpacking pt1-1.0_1                [■■■■■■■■■■■■■⠹□□□□□]  70%
++ *   ( 2/6) Updating pt2-1.0_1 -> 1.0_2        [■■■■■■■■■■■■■■■■■■■] 100%
++ *   ( 3/6) Removing pt7-1.0_1
++ *   ( 1/5) Configuring pt1-1.0_1
++ * The unpack bar follows the files extracted (unpack callback). Every
++ * line ends with a newline before the next package, so output of the
++ * packages' INSTALL/REMOVE scripts lands between lines, never inside.
++ * Only on a terminal and without -d or -v.
++ */
++static struct {
++	bool active;		/* per-package lines for this step */
++	bool open;		/* a line with a bar is on screen, no newline */
++	bool bar;
++	bool suspended;		/* closed to let a message through */
++	unsigned int total;
++	unsigned int done;
++	int pct;
++	unsigned int frame;
++	char label[XBPS_NAME_SIZE * 2 + 32];
++	char pkgname[XBPS_NAME_SIZE];
++} pk;
++
++static unsigned int
++count_step_pkgs(struct xbps_handle *xhp, bool configure)
++{
++	xbps_array_t pkgs;
++	unsigned int i, n = 0;
++
++	if (xhp->transd == NULL)
++		return 0;
++	pkgs = xbps_dictionary_get(xhp->transd, "packages");
++	for (i = 0; i < xbps_array_count(pkgs); i++) {
++		xbps_trans_type_t ttype;
++
++		ttype = xbps_transaction_pkg_type(xbps_array_get(pkgs, i));
++		if (ttype == XBPS_TRANS_HOLD)
++			continue;
++		if (configure ? ttype == XBPS_TRANS_REMOVE :
 +		    ttype == XBPS_TRANS_CONFIGURE)
 +			continue;
 +		n++;
@@ -756,52 +901,182 @@ index 63fc574..352b867 100644
 +}
 +
 +static void
-+verify_line_close(void)
++pk_draw(void)
 +{
-+	if (vfy.open) {
-+		printf("\n");
-+		fflush(stdout);
-+	}
-+	vfy.open = false;
++	line_print(pk.done, pk.total, pk.label, pk.pct, pk.bar);
 +}
 +
 +static void
-+verify_line_draw(void)
++pk_close(bool complete)
 +{
-+	char left[64], bar[2048];
-+	int cols, barw, leftw, pct;
-+	unsigned int total = vfy.total > vfy.done ? vfy.total : vfy.done;
++	if (pk.open) {
++		if (complete && pk.bar && pk.pct < 100) {
++			pk.pct = 100;
++			pk_draw();
++		}
++		printf("\n");
++		fflush(stdout);
++	}
++	pk.open = false;
++	pk.suspended = false;
++}
 +
-+	cols = get_maxcols();
-+	if (cols <= 0)
-+		cols = 80;
-+	pct = total ? (int)(vfy.done * 100 / total) : 100;
-+	snprintf(left, sizeof left, "(%u/%u) checking package integrity",
-+	    vfy.done, total);
++static void
++pk_begin(struct xbps_handle *xhp, bool configure)
++{
++	pk_close(true);
++	memset(&pk, 0, sizeof pk);
++	pk.total = count_step_pkgs(xhp, configure);
++	pk.active = isatty(STDOUT_FILENO) &&
++	    !(xhp->flags & (XBPS_FLAG_DEBUG | XBPS_FLAG_VERBOSE));
++}
 +
-+	/* "left" + " [" + bar + "] " + "100%", one column spare */
-+	barw = cols - (int)strlen(left) - 1 - 2 - 2 - 4 - 1;
-+	if (barw > 120)
-+		barw = 120;
-+	if (barw < 10)
-+		barw = 10;
-+	leftw = cols - barw - 2 - 2 - 4 - 1;
-+	if (leftw < (int)strlen(left))
-+		leftw = (int)strlen(left);
++static void
++pk_new_line(const char *pkgver, bool withbar, const char *fmt, ...)
++{
++	va_list ap;
 +
-+	progress_bar(bar, sizeof bar, barw, pct);
++	pk_close(true);
++	pk.done++;
++	pk.pct = 0;
++	pk.bar = withbar;
++	va_start(ap, fmt);
++	vsnprintf(pk.label, sizeof pk.label, fmt, ap);
++	va_end(ap);
++	if (pkgver == NULL ||
++	    !xbps_pkg_name(pk.pkgname, sizeof pk.pkgname, pkgver))
++		pk.pkgname[0] = '\0';
++	pk_draw();
++	if (withbar) {
++		pk.open = true;
++	} else {
++		printf("\n");
++		fflush(stdout);
++	}
++}
 +
-+	printf("\r%-*s [%s] %3d%%\033[K", leftw, left, bar, pct);
-+	fflush(stdout);
-+	vfy.open = true;
-+	if (vfy.done >= total)
-+		verify_line_close();
++/* let a message through without losing the package line */
++static void
++pk_suspend(void)
++{
++	if (pk.open) {
++		printf("\n");
++		fflush(stdout);
++		pk.open = false;
++		pk.suspended = true;
++	}
++}
++
++static void
++pk_resume(void)
++{
++	if (pk.suspended) {
++		pk.suspended = false;
++		pk.open = true;
++		pk_draw();
++	}
++}
++
++/* called by the unpack callback for every file extracted */
++void
++state_unpack_progress(const struct xbps_unpack_cb_data *xpd)
++{
++	unsigned int frame;
++	int pct;
++
++	if (!pk.active || !pk.open || !pk.bar || xpd->entry_total_count <= 0)
++		return;
++	pct = (int)(xpd->entry_extract_count * 100 / xpd->entry_total_count);
++	if (pct > 100)
++		pct = 100;
++	frame = progress_frame();
++	/* redraw only when something visible changes */
++	if (pct == pk.pct && frame == pk.frame)
++		return;
++	pk.pct = pct;
++	pk.frame = frame;
++	pk_draw();
++}
++
++/* ends whatever line is still open (e.g. with -U there is no configure step) */
++void
++state_lines_finish(void)
++{
++	pk_close(true);
++	pk.active = false;
++}
++
++static void
++phase_begin(struct xbps_handle *xhp, const char *label, unsigned int total)
++{
++	ph.label = label;
++	ph.total = total;
++	ph.done = 0;
++	ph.last[0] = '\0';
++	ph.open = false;
++	ph.active = isatty(STDOUT_FILENO) && !(xhp->flags & XBPS_FLAG_DEBUG);
++}
++
++/* one more package done (repeated messages for the same one count once) */
++static void
++phase_step(const char *pkgver)
++{
++	char pkgname[XBPS_NAME_SIZE];
++
++	if (pkgver == NULL || !xbps_pkg_name(pkgname, sizeof pkgname, pkgver))
++		pkgname[0] = '\0';
++	if (pkgname[0] == '\0' || strcmp(pkgname, ph.last) != 0) {
++		ph.done++;
++		xbps_strlcpy(ph.last, pkgname, sizeof ph.last);
++	}
++	phase_draw();
++}
++
++/*
++ * Ends the phase line. `complete' is false when a phase is cut short
++ * by an error, so the line stays where it stopped; otherwise it is
++ * drawn at 100% (a package without files to collect sends no message).
++ */
++static void
++phase_end(bool complete)
++{
++	if (ph.active && ph.open && complete && ph.done < ph.total) {
++		ph.done = ph.total;
++		phase_draw();
++	}
++	if (ph.open) {
++		printf("\n");
++		fflush(stdout);
++	}
++	ph.open = false;
++	ph.active = false;
++}
++
++static bool
++is_fail_state(xbps_state_t state)
++{
++	switch (state) {
++	case XBPS_STATE_TRANS_FAIL:
++	case XBPS_STATE_TRANS_HOOKS_FAIL:
++	case XBPS_STATE_UNPACK_FAIL:
++	case XBPS_STATE_UPDATE_FAIL:
++	case XBPS_STATE_CONFIGURE_FAIL:
++	case XBPS_STATE_REMOVE_FAIL:
++	case XBPS_STATE_VERIFY_FAIL:
++	case XBPS_STATE_FILES_FAIL:
++	case XBPS_STATE_DOWNLOAD_FAIL:
++	case XBPS_STATE_REPOSYNC_FAIL:
++	case XBPS_STATE_CONFIG_FILE_FAIL:
++		return true;
++	default:
++		return false;
++	}
 +}
 +
  int
  state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  {
-@@ -45,6 +124,18 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -45,22 +360,90 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  		openlog("xbps-install", 0, LOG_USER);
  	}
  
@@ -813,38 +1088,216 @@ index 63fc574..352b867 100644
 +	 */
 +	if (xscd->state != XBPS_STATE_DOWNLOAD)
 +		fetch_parallel_finish(xscd->xhp);
-+	/* same for an unfinished integrity check line */
-+	if (xscd->state != XBPS_STATE_VERIFY)
-+		verify_line_close();
++	/* same for an unfinished phase line */
++	if (xscd->state != XBPS_STATE_VERIFY && xscd->state != XBPS_STATE_FILES)
++		phase_end(!is_fail_state(xscd->state));
++
++	/* and for an open per-package line */
++	if (pk.active) {
++		switch (xscd->state) {
++		case XBPS_STATE_UNPACK:
++		case XBPS_STATE_UPDATE:
++		case XBPS_STATE_REMOVE:
++		case XBPS_STATE_INSTALL:
++		case XBPS_STATE_REMOVE_FILE:
++		case XBPS_STATE_REMOVE_FILE_OBSOLETE:
++		case XBPS_STATE_REMOVE_DONE:
++		case XBPS_STATE_CONFIGURE:
++		case XBPS_STATE_CONFIGURE_DONE:
++		case XBPS_STATE_INSTALL_DONE:
++		case XBPS_STATE_UPDATE_DONE:
++			/* handled below, or nothing to print */
++			break;
++		case XBPS_STATE_REMOVE_FILE_FAIL:
++		case XBPS_STATE_REMOVE_FILE_HASH_FAIL:
++		case XBPS_STATE_REMOVE_FILE_OBSOLETE_FAIL:
++			/* not-empty or busy dirs are silently ignored below */
++			if (xscd->err != ENOTEMPTY && xscd->err != EBUSY)
++				pk_suspend();
++			break;
++		case XBPS_STATE_CONFIG_FILE:
++		case XBPS_STATE_UNPACK_FILE_PRESERVED:
++		case XBPS_STATE_ALTGROUP_ADDED:
++		case XBPS_STATE_ALTGROUP_REMOVED:
++		case XBPS_STATE_ALTGROUP_SWITCHED:
++		case XBPS_STATE_ALTGROUP_LINK_ADDED:
++		case XBPS_STATE_ALTGROUP_LINK_REMOVED:
++			/* informative message about the current package */
++			pk_suspend();
++			break;
++		default:
++			pk_close(!is_fail_state(xscd->state));
++			if (xscd->state != XBPS_STATE_TRANS_CONFIGURE)
++				pk.active = false;
++			break;
++		}
++	}
 +
  	switch (xscd->state) {
  	/* notifications */
  	case XBPS_STATE_TRANS_DOWNLOAD:
-@@ -52,6 +143,10 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+ 		printf("\n[*] Downloading packages\n");
  		break;
  	case XBPS_STATE_TRANS_VERIFY:
- 		printf("\n[*] Verifying package integrity\n");
-+		vfy.total = count_verify_pkgs(xscd->xhp);
-+		vfy.done = 0;
-+		vfy.active = isatty(STDOUT_FILENO) &&
-+		    !(xscd->xhp->flags & XBPS_FLAG_DEBUG);
+-		printf("\n[*] Verifying package integrity\n");
++		phase_begin(xscd->xhp, "Verifying package integrity",
++		    count_phase_pkgs(xscd->xhp, false));
++		/*
++		 * On a terminal the "(n/total) ..." line says it all and
++		 * goes right under the previous one, like pacman; the
++		 * header is only kept for logs.
++		 */
++		if (!ph.active)
++			printf("\n[*] Verifying package integrity\n");
  		break;
  	case XBPS_STATE_TRANS_FILES:
- 		printf("\n[*] Collecting package files\n");
-@@ -79,7 +174,12 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+-		printf("\n[*] Collecting package files\n");
++		phase_begin(xscd->xhp, "Collecting package files",
++		    count_phase_pkgs(xscd->xhp, true));
++		if (!ph.active)
++			printf("\n[*] Collecting package files\n");
+ 		break;
+ 	case XBPS_STATE_TRANS_RUN:
+-		printf("\n[*] Unpacking packages\n");
++		pk_begin(xscd->xhp, false);
++		if (!pk.active)
++			printf("\n[*] Unpacking packages\n");
+ 		break;
+ 	case XBPS_STATE_TRANS_CONFIGURE:
+-		printf("\n[*] Configuring unpacked packages\n");
++		pk_begin(xscd->xhp, true);
++		if (!pk.active)
++			printf("\n[*] Configuring unpacked packages\n");
+ 		break;
+ 	case XBPS_STATE_TRANS_HOOKS:
+ 		if (xscd->desc[0] == '(')
+@@ -79,26 +462,45 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  			printf("%s\n", xscd->desc);
  		break;
  	case XBPS_STATE_VERIFY:
 -		printf("%s\n", xscd->desc);
-+		if (vfy.active) {
-+			vfy.done++;
-+			verify_line_draw();
-+		} else {
++		if (ph.active)
++			phase_step(xscd->arg);
++		else
 +			printf("%s\n", xscd->desc);
-+		}
  		break;
  	case XBPS_STATE_FILES:
- 		printf("%s\n", xscd->desc);
+-		printf("%s\n", xscd->desc);
++		if (ph.active)
++			phase_step(xscd->arg);
++		else
++			printf("%s\n", xscd->desc);
+ 		break;
+ 	case XBPS_STATE_CONFIG_FILE:
+ 		if (xscd->desc != NULL)
+ 			printf("%s\n", xscd->desc);
+ 		break;
+ 	case XBPS_STATE_REMOVE:
+-		printf("%s: removing ...\n", xscd->arg);
++		if (pk.active)
++			pk_new_line(xscd->arg, false, "Removing %s", xscd->arg);
++		else
++			printf("%s: removing ...\n", xscd->arg);
+ 		break;
+ 	case XBPS_STATE_CONFIGURE:
+-		printf("%s: configuring ...\n", xscd->arg);
++		if (pk.active)
++			pk_new_line(xscd->arg, false, "Configuring %s", xscd->arg);
++		else
++			printf("%s: configuring ...\n", xscd->arg);
+ 		break;
+ 	case XBPS_STATE_CONFIGURE_DONE:
+ 		/* empty */
+ 		break;
+ 	case XBPS_STATE_UNPACK:
+-		printf("%s: unpacking ...\n", xscd->arg);
++		if (!pk.active) {
++			printf("%s: unpacking ...\n", xscd->arg);
++			break;
++		}
++		/* an update already opened the line for this package */
++		if (!(pk.open && xbps_pkg_name(pkgname, sizeof pkgname, xscd->arg) &&
++		    strcmp(pkgname, pk.pkgname) == 0))
++			pk_new_line(xscd->arg, true, "Unpacking %s", xscd->arg);
+ 		break;
+ 	case XBPS_STATE_INSTALL:
+ 	case XBPS_STATE_DOWNLOAD:
+@@ -112,7 +514,11 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+ 			xbps_unreachable();
+ 		pkgd = xbps_pkgdb_get_pkg(xscd->xhp, pkgname);
+ 		xbps_dictionary_get_cstring_nocopy(pkgd, "pkgver", &instver);
+-		printf("%s: updating to %s ...\n", instver, newver);
++		if (pk.active)
++			pk_new_line(xscd->arg, true, "Updating %s -> %s",
++			    instver, newver);
++		else
++			printf("%s: updating to %s ...\n", instver, newver);
+ 		if (slog) {
+ 			syslog(LOG_NOTICE, "%s: updating to %s ... "
+ 			    "(rootdir: %s)\n", instver, newver,
+@@ -122,6 +528,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+ 	/* success */
+ 	case XBPS_STATE_REMOVE_FILE:
+ 	case XBPS_STATE_REMOVE_FILE_OBSOLETE:
++		if (pk.active)
++			break;	/* the package line already says it */
+ 		if (xscd->xhp->flags & XBPS_FLAG_VERBOSE)
+ 			printf("%s\n", xscd->desc);
+ 		else {
+@@ -130,7 +538,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+ 		}
+ 		break;
+ 	case XBPS_STATE_INSTALL_DONE:
+-		printf("%s: installed successfully.\n", xscd->arg);
++		if (!pk.active)
++			printf("%s: installed successfully.\n", xscd->arg);
+ 		if (slog) {
+ 			syslog(LOG_NOTICE, "Installed `%s' successfully "
+ 			    "(rootdir: %s).", xscd->arg,
+@@ -138,7 +547,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+ 		}
+ 		break;
+ 	case XBPS_STATE_UPDATE_DONE:
+-		printf("%s: updated successfully.\n", xscd->arg);
++		if (!pk.active)
++			printf("%s: updated successfully.\n", xscd->arg);
+ 		if (slog) {
+ 			syslog(LOG_NOTICE, "Updated `%s' successfully "
+ 			    "(rootdir: %s).", xscd->arg,
+@@ -146,7 +556,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+ 		}
+ 		break;
+ 	case XBPS_STATE_REMOVE_DONE:
+-		printf("%s: removed successfully.\n", xscd->arg);
++		if (!pk.active)
++			printf("%s: removed successfully.\n", xscd->arg);
+ 		if (slog) {
+ 			syslog(LOG_NOTICE, "Removed `%s' successfully "
+ 			    "(rootdir: %s).", xscd->arg,
+@@ -203,5 +614,6 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+ 		break;
+ 	}
+ 
++	pk_resume();
+ 	return rv;
+ }
+diff --git a/bin/xbps-install/transaction.c b/bin/xbps-install/transaction.c
+index d24041a..f4d78e9 100644
+--- a/bin/xbps-install/transaction.c
++++ b/bin/xbps-install/transaction.c
+@@ -631,7 +631,11 @@ proceed:
+ 	/*
+ 	 * It's time to run the transaction!
+ 	 */
+-	if ((rv = xbps_transaction_commit(xhp)) == 0) {
++	rv = xbps_transaction_commit(xhp);
++	/* xbps-remove links this file without state_cb.c */
++	if (state_lines_finish != NULL)
++		state_lines_finish();
++	if (rv == 0) {
+ 		printf("\n%u downloaded, %u installed, %u updated, "
+ 		    "%u configured, %u removed, %u on hold.\n",
+ 		    trans->dl_pkgcnt, trans->inst_pkgcnt,
 diff --git a/bin/xbps-install/xbps-install.1 b/bin/xbps-install/xbps-install.1
 index 020edff..491fa7c 100644
 --- a/bin/xbps-install/xbps-install.1
