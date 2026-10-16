@@ -12,18 +12,19 @@ index e7933d2..9ad89c9 100644
  /* from state_cb.c */
  int	state_cb(const struct xbps_state_cb_data *, void *);
 diff --git a/bin/xbps-install/fetch_cb.c b/bin/xbps-install/fetch_cb.c
-index f9860fe..de30348 100644
+index f9860fe..315f561 100644
 --- a/bin/xbps-install/fetch_cb.c
 +++ b/bin/xbps-install/fetch_cb.c
-@@ -30,6 +30,7 @@
+@@ -30,6 +30,8 @@
   * $FreeBSD: src/usr.bin/fetch/fetch.c,v 1.84.2.1 2009/08/03 08:13:06 kensmith Exp $
   */
  
 +#include <sys/ioctl.h>
++#include <pthread.h>
  #include <sys/param.h>
  #include <sys/stat.h>
  #include <sys/time.h>
-@@ -40,6 +41,7 @@
+@@ -40,6 +42,7 @@
  #include <stdio.h>
  #include <stdlib.h>
  #include <string.h>
@@ -31,7 +32,7 @@ index f9860fe..de30348 100644
  #include <time.h>
  #include <unistd.h>
  
-@@ -183,12 +185,476 @@ stat_display(const struct xbps_fetch_cb_data *xfpd, void *cbdata)
+@@ -183,12 +186,573 @@ stat_display(const struct xbps_fetch_cb_data *xfpd, void *cbdata)
  	}
  }
  
@@ -39,18 +40,23 @@ index f9860fe..de30348 100644
 + * VoidBR progress bar, shared by the download and the integrity check
 + * displays:
 + *
-+ *   [■■■■■■■■■■■■|□□□□□□□]
++ *   [■■■■■■■■■■■■⠹□□□□□□□]
 + *
-+ * Every completed step is a square; the leading cell is a spinner
-+ * (| / - \) that keeps turning while there is work going on. Spinner
-+ * frames come from a monotonic clock (~150ms each), so every bar on
-+ * screen turns in sync, however often it is redrawn. At 100% the
-+ * spinner is gone and the bar is all squares.
++ * Every completed step is a square; the leading cell is a spinner that
++ * keeps turning while there is work going on: the braille dots
++ * ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏ on a UTF-8 terminal, or | / - \ on the Linux
++ * console (its fonts have no braille) and without UTF-8. Spinner
++ * frames come from a monotonic clock (SPIN_MS each), so every bar on
++ * screen turns in sync; the parallel download display is redrawn at
++ * that same pace by its own thread, so no frame is skipped. At 100%
++ * the spinner is gone and the bar is all squares.
 + *
 + * Colors: squares in green, spinner in yellow, the rest in gray;
 + * disabled by NO_COLOR (https://no-color.org) or TERM=dumb.
 + * Without a UTF-8 locale the squares become "#" and "-".
 + */
++#define SPIN_MS	100
++
 +static const char *green = "\033[32m";
 +static const char *yellow = "\033[33m";
 +static const char *gray = "\033[90m";
@@ -89,16 +95,18 @@ index f9860fe..de30348 100644
 +	struct timeval tv;
 +
 +	get_time(&tv);
-+	return (unsigned int)((tv.tv_sec * 1000 + tv.tv_usec / 1000) / 150);
++	return (unsigned int)((tv.tv_sec * 1000 + tv.tv_usec / 1000) / SPIN_MS);
 +}
 +
 +void
 +progress_bar(char *buf, size_t len, int width, int pct)
 +{
-+	static const char spin[] = "|/-\\";
-+	static int utf8 = -1, color = -1;
-+	const char *cur = NULL, *c, *glyph;
-+	char tip[2] = { 0, 0 };
++	static const char *braille[] = {
++		"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"
++	};
++	static const char *ascii[] = { "|", "/", "-", "\\" };
++	static int utf8 = -1, color = -1, dots = -1;
++	const char *cur = NULL, *c, *glyph, *tip;
 +	size_t off = 0;
 +	int fill, i;
 +	bool done;
@@ -109,8 +117,12 @@ index f9860fe..de30348 100644
 +	} while (0)
 +
 +	if (utf8 == -1) {
++		const char *term = getenv("TERM");
++
 +		utf8 = locale_is_utf8();
 +		color = use_colors();
++		/* the Linux console fonts have no braille glyphs */
++		dots = utf8 && !(term && strcmp(term, "linux") == 0);
 +	}
 +	if (len == 0)
 +		return;
@@ -120,7 +132,7 @@ index f9860fe..de30348 100644
 +		pct = 100;
 +	fill = width * pct / 100;
 +	done = fill >= width;
-+	tip[0] = spin[bar_frame() % 4];
++	tip = dots ? braille[bar_frame() % 10] : ascii[bar_frame() % 4];
 +
 +	for (i = 0; i < width; i++) {
 +		if (i < fill) {
@@ -171,9 +183,21 @@ index f9860fe..de30348 100644
 +	uint64_t done_bytes;
 +	struct timeval start;
 +	struct timeval lastdraw;
++	struct xbps_handle *xhp;
++	pthread_t thr;		/* redraws the display every SPIN_MS */
++	bool thr_running;
++	bool thr_stop;
 +	bool open;
 +	bool fancy;
 +} par;
++
++/*
++ * Guards `par': taken by the download callbacks (which libxbps already
++ * serializes among themselves) and by the redraw thread. Lock order is
++ * always libxbps callback lock -> par_mtx; the redraw thread only ever
++ * takes par_mtx.
++ */
++static pthread_mutex_t par_mtx = PTHREAD_MUTEX_INITIALIZER;
 +
 +static double
 +tv_secs(const struct timeval *tv)
@@ -289,7 +313,7 @@ index f9860fe..de30348 100644
 +}
 +
 +static void
-+par_redraw(const struct xbps_fetch_cb_data *xfpd, bool force, bool final)
++par_redraw(struct xbps_handle *xhp, bool force, bool final)
 +{
 +	struct timeval now;
 +	uint64_t total_size = 0, done;
@@ -335,10 +359,10 @@ index f9860fe..de30348 100644
 +	}
 +
 +	/* total */
-+	if (xfpd->xhp->transd != NULL) {
-+		xbps_dictionary_get_uint64(xfpd->xhp->transd,
++	if (xhp != NULL && xhp->transd != NULL) {
++		xbps_dictionary_get_uint64(xhp->transd,
 +		    "total-download-size", &total_size);
-+		xbps_dictionary_get_uint32(xfpd->xhp->transd,
++		xbps_dictionary_get_uint32(xhp->transd,
 +		    "total-download-pkgs", &total_pkgs);
 +	}
 +	done = par.done_bytes;
@@ -381,8 +405,55 @@ index f9860fe..de30348 100644
 +	memset(&par, 0, sizeof par);
 +}
 +
++static void *
++par_redraw_thread(void *arg UNUSED)
++{
++	struct timespec ts = { 0, SPIN_MS * 1000000L };
++
++	for (;;) {
++		pthread_mutex_lock(&par_mtx);
++		if (par.thr_stop) {
++			pthread_mutex_unlock(&par_mtx);
++			break;
++		}
++		if (par.nslots > 0 || par.drawn > 0)
++			par_redraw(par.xhp, true, false);
++		pthread_mutex_unlock(&par_mtx);
++		nanosleep(&ts, NULL);
++	}
++	return NULL;
++}
++
++/* call WITHOUT par_mtx held */
 +static void
-+par_progress_cb(const struct xbps_fetch_cb_data *xfpd)
++par_stop_thread(void)
++{
++	pthread_t thr;
++
++	pthread_mutex_lock(&par_mtx);
++	if (!par.thr_running) {
++		pthread_mutex_unlock(&par_mtx);
++		return;
++	}
++	par.thr_stop = true;
++	thr = par.thr;
++	pthread_mutex_unlock(&par_mtx);
++
++	pthread_join(thr, NULL);
++
++	pthread_mutex_lock(&par_mtx);
++	par.thr_running = false;
++	par.thr_stop = false;
++	pthread_mutex_unlock(&par_mtx);
++}
++
++/*
++ * Updates the display state; returns true when the last package just
++ * finished and the display has to be closed (done by the caller, with
++ * par_mtx released, since that stops the redraw thread).
++ */
++static bool
++par_progress_locked(const struct xbps_fetch_cb_data *xfpd)
 +{
 +	struct pslot *sl, *n;
 +	uint32_t total_pkgs = 0;
@@ -390,43 +461,47 @@ index f9860fe..de30348 100644
 +	/* signatures are tiny, keep the display about the packages */
 +	if (ends_with(xfpd->file_name, ".sig2") ||
 +	    ends_with(xfpd->file_name, ".sig"))
-+		return;
++		return false;
 +
 +	if (!par.open) {
 +		par.open = true;
++		par.xhp = xfpd->xhp;
 +		par.fancy = isatty(STDERR_FILENO) &&
 +		    !(xfpd->xhp->flags & XBPS_FLAG_DEBUG);
 +		get_time(&par.start);
++		if (par.fancy && pthread_create(&par.thr, NULL,
++		    par_redraw_thread, NULL) == 0)
++			par.thr_running = true;
 +	}
 +
 +	if (xfpd->cb_start) {
 +		n = realloc(par.slots, (par.nslots + 1) * sizeof(*n));
 +		if (n == NULL)
-+			return;
++			return false;
 +		par.slots = n;
 +		sl = &par.slots[par.nslots];
 +		memset(sl, 0, sizeof(*sl));
 +		if ((sl->file = strdup(xfpd->file_name)) == NULL)
-+			return;
++			return false;
 +		par.nslots++;
 +		make_label(sl->label, sizeof sl->label, xfpd->file_name);
 +		sl->size = xfpd->file_size;
 +		sl->offset = xfpd->file_offset;
 +		sl->dloaded = xfpd->file_dloaded;
 +		get_time(&sl->start);
-+		if (par.fancy)
-+			par_redraw(xfpd, true, false);
-+		return;
++		if (par.fancy && !par.thr_running)
++			par_redraw(par.xhp, true, false);
++		return false;
 +	}
 +
 +	if ((sl = par_find(xfpd->file_name)) == NULL)
-+		return;
++		return false;
 +
 +	if (xfpd->cb_update) {
 +		sl->dloaded = xfpd->file_dloaded;
-+		if (par.fancy)
-+			par_redraw(xfpd, false, false);
-+		return;
++		if (par.fancy && !par.thr_running)
++			par_redraw(par.xhp, false, false);
++		return false;
 +	}
 +
 +	/* cb_end */
@@ -443,9 +518,10 @@ index f9860fe..de30348 100644
 +	if (par.fancy) {
 +		bool last = total_pkgs > 0 && par.done_pkgs >= total_pkgs;
 +
-+		par_redraw(xfpd, true, last);
 +		if (last)
-+			par_reset();
++			return true;
++		if (!par.thr_running)
++			par_redraw(par.xhp, true, false);
 +	} else {
 +		struct timeval now;
 +		char size[8], rate[16];
@@ -469,6 +545,26 @@ index f9860fe..de30348 100644
 +		if (total_pkgs > 0 && par.done_pkgs >= total_pkgs)
 +			par_reset();
 +	}
++	return false;
++}
++
++static void
++par_progress_cb(const struct xbps_fetch_cb_data *xfpd)
++{
++	bool last;
++
++	pthread_mutex_lock(&par_mtx);
++	last = par_progress_locked(xfpd);
++	pthread_mutex_unlock(&par_mtx);
++
++	if (last) {
++		/* all packages downloaded: final picture, then close */
++		par_stop_thread();
++		pthread_mutex_lock(&par_mtx);
++		par_redraw(par.xhp, true, true);
++		par_reset();
++		pthread_mutex_unlock(&par_mtx);
++	}
 +}
 +
 +/*
@@ -481,17 +577,19 @@ index f9860fe..de30348 100644
 +void
 +fetch_parallel_finish(struct xbps_handle *xhp)
 +{
-+	struct xbps_fetch_cb_data xfpd;
++	par_stop_thread();
 +
-+	if (!par.open)
++	pthread_mutex_lock(&par_mtx);
++	if (!par.open) {
++		pthread_mutex_unlock(&par_mtx);
 +		return;
++	}
 +	if (par.fancy && par.drawn > 0) {
-+		memset(&xfpd, 0, sizeof xfpd);
-+		xfpd.xhp = xhp;
-+		par_redraw(&xfpd, true, false);
++		par_redraw(xhp, true, false);
 +		par.drawn = 0;
 +	}
 +	par_reset();
++	pthread_mutex_unlock(&par_mtx);
 +}
 +
  void
