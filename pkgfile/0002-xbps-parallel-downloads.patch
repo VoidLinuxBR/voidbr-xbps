@@ -1,14 +1,15 @@
 diff --git a/bin/xbps-install/defs.h b/bin/xbps-install/defs.h
-index e7933d2..d9be033 100644
+index e7933d2..c095c1c 100644
 --- a/bin/xbps-install/defs.h
 +++ b/bin/xbps-install/defs.h
-@@ -58,9 +58,14 @@ bool	noyes(const char *, ...);
+@@ -58,9 +58,15 @@ bool	noyes(const char *, ...);
  
  /* from fetch_cb.c */
  void	fetch_file_progress_cb(const struct xbps_fetch_cb_data *, void *);
 +void	fetch_parallel_finish(struct xbps_handle *);
 +void	progress_bar(char *, size_t, int, int);
 +unsigned int	progress_frame(void);
++int	progress_bar_width(int);
  
  /* from state_cb.c */
  int	state_cb(const struct xbps_state_cb_data *, void *);
@@ -18,7 +19,7 @@ index e7933d2..d9be033 100644
  /* From util.c */
  void	print_package_line(const char *, unsigned int, bool);
 diff --git a/bin/xbps-install/fetch_cb.c b/bin/xbps-install/fetch_cb.c
-index f9860fe..7d8e37e 100644
+index f9860fe..252afb8 100644
 --- a/bin/xbps-install/fetch_cb.c
 +++ b/bin/xbps-install/fetch_cb.c
 @@ -30,6 +30,8 @@
@@ -38,7 +39,7 @@ index f9860fe..7d8e37e 100644
  #include <time.h>
  #include <unistd.h>
  
-@@ -183,12 +186,579 @@ stat_display(const struct xbps_fetch_cb_data *xfpd, void *cbdata)
+@@ -183,12 +186,592 @@ stat_display(const struct xbps_fetch_cb_data *xfpd, void *cbdata)
  	}
  }
  
@@ -102,6 +103,23 @@ index f9860fe..7d8e37e 100644
 +
 +	get_time(&tv);
 +	return (unsigned int)((tv.tv_sec * 1000 + tv.tv_usec / 1000) / SPIN_MS);
++}
++
++/*
++ * Width of every progress bar on screen, so the download lines and the
++ * numbered lines (state_cb.c) all have their bars in the same columns,
++ * like pacman. A download line is
++ *   " name size rate time [bar] pct"  ->  1+name+1+7+1+10+1+5+1+[bar]+1+4
++ * so the bar starts at column (cols - width - 7) and ends with the line.
++ */
++int
++progress_bar_width(int cols)
++{
++	int barw = 20;
++
++	if (cols - 34 - barw < 16)
++		barw = 10;
++	return barw;
 +}
 +
 +unsigned int
@@ -289,7 +307,7 @@ index f9860fe..7d8e37e 100644
 +		double secs, int cols)
 +{
 +	char sz[8], rate[16], tm[8], bar[512];
-+	int barw = 20, namew, pct;
++	int barw = progress_bar_width(cols), namew, pct;
 +
 +	if (total > 0) {
 +		pct = (int)((double)done * 100.0 / (double)total);
@@ -311,10 +329,6 @@ index f9860fe..7d8e37e 100644
 +
 +	/* " " + name + " " + right part (7+1+10+1+5+1+[bar]+1+4) */
 +	namew = cols - 1 - (32 + barw) - 1;
-+	if (namew < 16) {
-+		barw = 10;
-+		namew = cols - 1 - (32 + barw) - 1;
-+	}
 +	if (namew < 8)
 +		namew = 8;
 +
@@ -743,10 +757,10 @@ index 41c543c..17bfcec 100644
  	maxcols = get_maxcols();
  
 diff --git a/bin/xbps-install/state_cb.c b/bin/xbps-install/state_cb.c
-index 63fc574..ede3bd4 100644
+index 63fc574..af55cbb 100644
 --- a/bin/xbps-install/state_cb.c
 +++ b/bin/xbps-install/state_cb.c
-@@ -23,14 +23,329 @@
+@@ -23,14 +23,333 @@
   * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
   */
  
@@ -772,10 +786,9 @@ index 63fc574..ede3bd4 100644
 + */
 +/*
 + * Every numbered line (phases above, and the per-package lines of the
-+ * unpack and configure steps below) has a fixed-width left part, so
-+ * their bars line up. Longer labels are cut.
++ * unpack and configure steps below) puts its bar in the same columns
++ * as the download lines; longer labels are cut.
 + */
-+#define LINE_LABEL_W	44
 +
 +static struct {
 +	const char *label;
@@ -813,8 +826,8 @@ index 63fc574..ede3bd4 100644
 +line_print(unsigned int done, unsigned int total, const char *label,
 +    int pct, bool withbar)
 +{
-+	char left[128], bar[2048];
-+	int cols, barw, nw, leftw;
++	char left[256], bar[512];
++	int cols, barw, nw, leftw, labelw;
 +
 +	cols = get_maxcols();
 +	if (cols <= 0)
@@ -822,21 +835,26 @@ index 63fc574..ede3bd4 100644
 +	if (total < done)
 +		total = done;
 +	nw = snprintf(NULL, 0, "%u", total);
++
++	/*
++	 * Same bar width and columns as the download lines (see
++	 * progress_bar_width()): the text takes everything up to the bar.
++	 */
++	barw = progress_bar_width(cols);
++	leftw = cols - barw - 8;
++	labelw = leftw - (2 * nw + 4);
++	if (labelw < 8)
++		labelw = 8;
 +	snprintf(left, sizeof left, "(%*u/%u) %.*s", nw, done, total,
-+	    LINE_LABEL_W, label);
-+	leftw = 2 * nw + 4 + LINE_LABEL_W;
++	    labelw, label);
++	if (leftw < (int)strlen(left))
++		leftw = (int)strlen(left);
 +
 +	if (!withbar) {
 +		printf("\r%s\033[K", left);
 +		fflush(stdout);
 +		return;
 +	}
-+	/* left + " [" + bar + "] " + "100%", one column spare */
-+	barw = cols - leftw - 2 - 2 - 4 - 1;
-+	if (barw > 120)
-+		barw = 120;
-+	if (barw < 10)
-+		barw = 10;
 +	progress_bar(bar, sizeof bar, barw, pct);
 +	printf("\r%-*s [%s] %3d%%\033[K", leftw, left, bar, pct);
 +	fflush(stdout);
@@ -1076,7 +1094,7 @@ index 63fc574..ede3bd4 100644
  int
  state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  {
-@@ -45,22 +360,90 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -45,22 +364,90 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  		openlog("xbps-install", 0, LOG_USER);
  	}
  
@@ -1171,7 +1189,7 @@ index 63fc574..ede3bd4 100644
  		break;
  	case XBPS_STATE_TRANS_HOOKS:
  		if (xscd->desc[0] == '(')
-@@ -79,26 +462,45 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -79,26 +466,45 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  			printf("%s\n", xscd->desc);
  		break;
  	case XBPS_STATE_VERIFY:
@@ -1222,7 +1240,7 @@ index 63fc574..ede3bd4 100644
  		break;
  	case XBPS_STATE_INSTALL:
  	case XBPS_STATE_DOWNLOAD:
-@@ -112,7 +514,11 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -112,7 +518,11 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  			xbps_unreachable();
  		pkgd = xbps_pkgdb_get_pkg(xscd->xhp, pkgname);
  		xbps_dictionary_get_cstring_nocopy(pkgd, "pkgver", &instver);
@@ -1235,7 +1253,7 @@ index 63fc574..ede3bd4 100644
  		if (slog) {
  			syslog(LOG_NOTICE, "%s: updating to %s ... "
  			    "(rootdir: %s)\n", instver, newver,
-@@ -122,6 +528,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -122,6 +532,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  	/* success */
  	case XBPS_STATE_REMOVE_FILE:
  	case XBPS_STATE_REMOVE_FILE_OBSOLETE:
@@ -1244,7 +1262,7 @@ index 63fc574..ede3bd4 100644
  		if (xscd->xhp->flags & XBPS_FLAG_VERBOSE)
  			printf("%s\n", xscd->desc);
  		else {
-@@ -130,7 +538,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -130,7 +542,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  		}
  		break;
  	case XBPS_STATE_INSTALL_DONE:
@@ -1254,7 +1272,7 @@ index 63fc574..ede3bd4 100644
  		if (slog) {
  			syslog(LOG_NOTICE, "Installed `%s' successfully "
  			    "(rootdir: %s).", xscd->arg,
-@@ -138,7 +547,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -138,7 +551,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  		}
  		break;
  	case XBPS_STATE_UPDATE_DONE:
@@ -1264,7 +1282,7 @@ index 63fc574..ede3bd4 100644
  		if (slog) {
  			syslog(LOG_NOTICE, "Updated `%s' successfully "
  			    "(rootdir: %s).", xscd->arg,
-@@ -146,7 +556,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -146,7 +560,8 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  		}
  		break;
  	case XBPS_STATE_REMOVE_DONE:
@@ -1274,7 +1292,7 @@ index 63fc574..ede3bd4 100644
  		if (slog) {
  			syslog(LOG_NOTICE, "Removed `%s' successfully "
  			    "(rootdir: %s).", xscd->arg,
-@@ -203,5 +614,6 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
+@@ -203,5 +618,6 @@ state_cb(const struct xbps_state_cb_data *xscd, void *cbdata UNUSED)
  		break;
  	}
  
