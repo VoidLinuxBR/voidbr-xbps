@@ -1,12 +1,13 @@
+#!/usr/bin/env bash
 # Maintainer: Vilmar Catafesta <vcatafesta@gmail.com>
 
 pkgname=voidbr-xbps
 pkgdesc="XBPS package system utilities support hooks"
 pkgver=0.60.8
-pkgrel=15
-provides=(xbps libxbps)       # "eu SOU o xbps/libxbps, pra quem depender deles"
-replaces=(xbps libxbps)       # "remove o xbps/libxbps antigo automaticamente quando eu instalar"
-conflicts=(xbps libxbps)      # "nunca me deixe coexistir com o xbps/libxbps original"
+pkgrel=16
+provides=(xbps libxbps)  # "eu SOU o xbps/libxbps, pra quem depender deles"
+replaces=(xbps libxbps)  # "remove o xbps/libxbps antigo automaticamente quando eu instalar"
+conflicts=(xbps libxbps) # "nunca me deixe coexistir com o xbps/libxbps original"
 arch=('any')
 license=('MIT')
 #url="ssh://git@github.com/voidlinuxbr/${pkgname}"
